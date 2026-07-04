@@ -1,0 +1,13 @@
+# ads.txt for p2k-music.ca
+# Authorizes Google to sell this site's ad inventory. Google (and most ad
+# networks) will not serve ads reliably without this file.
+#
+# It MUST be reachable at the ROOT of the live domain, e.g.:
+#     https://p2k-music.ca/ads.txt
+# (Keeping it next to index.html means it deploys to the root automatically.)
+#
+# Format:  <ad-system-domain>, <publisher-id>, <relationship>, <cert-authority-id>
+# The pub-ID below is P2K's AdSense publisher ID (from ca-pub-2580922665149434).
+# f08c47fec0942fa0 is Google's fixed certification-authority ID (same for everyone).
+
+google.com, pub-2580922665149434, DIRECT, f08c47fec0942fa0

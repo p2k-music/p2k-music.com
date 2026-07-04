@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Home — p2k-music.ca</title>
+    <meta name="description" content="p2k-music.ca — official home of P2K. Stream previews, buy tracks, catch tour dates, and grab merch.">
+    <meta name="theme-color" content="#05060d">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-2580922665149434" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body data-page="home">
+    <div id="loader"><div class="loader-logo">p2k-music</div><div class="loader-bar"><span></span></div><div class="loader-sub">Loading the sound</div></div>
+    <div id="scrollProgress"></div>
+    <div id="cursorGlow"></div>
+    <canvas id="fxParticles"></canvas>
+    <canvas id="pageViz" class="page-viz"></canvas>
+    <div class="custom-bg" id="customBg" style="background-image: url('background.jpg');"></div>
+    <nav class="navbar" id="navbar">
+        <div class="nav-container">
+            <a href="index.html" class="logo"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+            <ul class="nav-links" id="navLinks">
+                <li><a class="navlink" data-nav="home" href="index.html">Home</a></li>
+                <li><a class="navlink" data-nav="about" href="about.html">About</a></li>
+                <li><a class="navlink" data-nav="music" href="music.html">Music</a></li>
+                <li><a class="navlink" data-nav="podcast" href="podcast.html">Podcast</a></li>
+                <li><a class="navlink" data-nav="videos" href="videos.html">Videos</a></li>
+                <li><a class="navlink" data-nav="tour" href="tour.html">Tour</a></li>
+                <li><a class="navlink" data-nav="gallery" href="gallery.html">Gallery</a></li>
+                <li><a class="navlink" data-nav="merch" href="merch.html">Merch</a></li>
+                <li><a class="navlink" data-nav="contact" href="contact.html">Contact</a></li>
+            </ul>
+            <div class="nav-right">
+                <span class="admin-badge" id="adminBadge" style="display:none;"><i class="fas fa-shield-alt"></i> Admin</span>
+                <button class="logout-btn" id="logoutBtn" onclick="logout()">Logout</button>
+                <a class="admin-button" id="adminLoginBtn" href="admin.html">Admin</a>
+                <div class="mobile-toggle" id="mobileToggle"><i class="fas fa-bars"></i></div>
+            </div>
+        </div>
+    </nav>
+    <main class="page-main">
+
+    <section class="page-hero" style="min-height:72vh; display:flex; flex-direction:column; align-items:center; justify-content:center;">
+        <span class="eyebrow"><span class="dot"></span> Official Artist Website</span>
+        <h1>P2K</h1>
+        <p>Beats, remixes &amp; experimental sound from the underground.<br><b style="color:#fff;">Stream the previews. Own the tracks.</b></p>
+        <div style="display:flex; gap:1rem; flex-wrap:wrap; justify-content:center; margin-top:1.8rem;">
+            <a href="music.html" class="cta-button"><i class="fas fa-headphones"></i> Explore Music</a>
+            <a href="tour.html" class="ghost-btn"><i class="fas fa-ticket"></i> Tour Dates</a>
+        </div>
+        <div class="hero-chips" style="display:flex; gap:0.7rem; flex-wrap:wrap; justify-content:center; margin-top:2.2rem;">
+            <span class="hero-chip"><i class="fas fa-compact-disc"></i> 51 Tracks</span>
+            <span class="hero-chip"><i class="fas fa-microphone"></i> Podcast</span>
+            <span class="hero-chip"><i class="fas fa-bag-shopping"></i> Merch</span>
+            <span class="hero-chip"><i class="fab fa-paypal"></i> Instant Buy</span>
+        </div>
+    </section>
+    <div class="marquee" aria-hidden="true">
+        <div class="marquee-track">
+            <span>Hip-Hop</span><span>Dubstep</span><span>Remix</span><span>Experimental</span><span>Beats</span><span>Underground</span><span>P2K</span>
+            <span>Hip-Hop</span><span>Dubstep</span><span>Remix</span><span>Experimental</span><span>Beats</span><span>Underground</span><span>P2K</span>
+        </div>
+    </div>
+
+        <div class="stats-band">
+        <div class="stats-grid">
+            <div class="stat-card reveal">
+                <div class="stat-num" data-count="51">0</div>
+                <div class="stat-label">Tracks Released</div>
+            </div>
+            <div class="stat-card reveal d1">
+                <div class="stat-num" data-count="24" data-suffix="K">0</div>
+                <div class="stat-label">Monthly Listeners</div>
+            </div>
+            <div class="stat-card reveal d2">
+                <div class="stat-num" data-count="37" data-suffix="+">0</div>
+                <div class="stat-label">Countries Reached</div>
+            </div>
+            <div class="stat-card reveal d3">
+                <div class="stat-num" data-count="8" data-suffix=" yrs">0</div>
+                <div class="stat-label">On The Scene</div>
+            </div>
+        </div>
+    </div>
+
+    <section id="featured" class="section featured">
+        <div class="featured-grid">
+            <div class="featured-art reveal">
+                <div class="spin-ring"></div>
+                <div class="vinyl-center"></div>
+            </div>
+            <div class="featured-info reveal d1">
+                <span class="featured-tag"><i class="fas fa-fire"></i> Latest Release</span>
+                <h3>T.H.C VOL2</h3>
+                <p>The newest drop from P2K — a deep, bass-driven cut built for late nights and loud systems. Preview it free, then own the full track.</p>
+                <div class="featured-meta">
+                    <div><b>2024</b> Released</div>
+                    <div><b>Single</b> Format</div>
+                    <div><b>$16</b> CAD</div>
+                </div>
+                <div class="featured-actions">
+                    <a class="cta-button" href="music.html"><i class="fas fa-play"></i> Play Latest</a>
+                    <a href="music.html" class="ghost-btn"><i class="fas fa-list"></i> Full Catalog</a>
+                </div>
+            </div>
+        </div>
+    </section>    <section class="section">
+        <div class="section-head"><span class="section-kicker">Explore</span><h2 class="section-title">Step Inside</h2></div>
+        <div class="songs-grid">
+            <a class="song-card" href="music.html" style="text-decoration:none;"><div class="song-title"><i class="fas fa-headphones"></i> Music</div><p style="color:var(--muted); line-height:1.5;">51 tracks — preview free, own the full version.</p></a>
+            <a class="song-card" href="podcast.html" style="text-decoration:none;"><div class="song-title"><i class="fas fa-podcast"></i> Podcast</div><p style="color:var(--muted); line-height:1.5;">Conversations &amp; guests from the underground.</p></a>
+            <a class="song-card" href="videos.html" style="text-decoration:none;"><div class="song-title"><i class="fas fa-film"></i> Videos</div><p style="color:var(--muted); line-height:1.5;">Visualizers, studio sessions &amp; live sets.</p></a>
+            <a class="song-card" href="tour.html" style="text-decoration:none;"><div class="song-title"><i class="fas fa-ticket"></i> Tour</div><p style="color:var(--muted); line-height:1.5;">Live dates — grab tickets on the spot.</p></a>
+            <a class="song-card" href="gallery.html" style="text-decoration:none;"><div class="song-title"><i class="fas fa-image"></i> Gallery</div><p style="color:var(--muted); line-height:1.5;">Photos from the studio and the stage.</p></a>
+            <a class="song-card" href="merch.html" style="text-decoration:none;"><div class="song-title"><i class="fas fa-bag-shopping"></i> Merch</div><p style="color:var(--muted); line-height:1.5;">Wear the sound — tees, hoodies &amp; vinyl.</p></a>
+        </div>
+    </section>
+
+    </main>
+
+    <div class="floating-music" id="floatingPlayer">
+        <div style="display:flex; align-items:center; gap:1rem;">
+            <button class="play-btn" id="globalPlayBtn" style="width:42px; height:42px;"><i class="fas fa-play"></i></button>
+            <div style="flex:1;">
+                <div style="display:flex; align-items:center; gap:0.6rem;">
+                    <div class="eq"><span></span><span></span><span></span><span></span></div>
+                    <div id="currentSongTitle" style="font-size:0.9rem; font-weight:600;">No song playing</div>
+                </div>
+                <div class="progress-bar" id="globalProgress" style="margin-top:0.5rem;"><div class="progress-fill" id="globalProgressFill"></div></div>
+            </div>
+        </div>
+    </div>
+    <button id="backToTop" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Back to top"><i class="fas fa-arrow-up"></i></button>
+    <div class="cookie-banner" id="cookieBanner">
+        <div class="cookie-text"><strong><i class="fas fa-cookie-bite"></i> Cookies</strong>We use cookies for analytics and to show ads that help keep the music free. You can accept or reject — your choice is remembered.</div>
+        <div class="cookie-actions"><button class="cookie-btn reject" onclick="setCookieConsent('rejected')">Reject</button><button class="cookie-btn accept" onclick="setCookieConsent('accepted')">Accept</button></div>
+    </div>
+    <footer class="footer">
+        <a href="index.html" class="logo" style="font-size:1.5rem; justify-content:center;"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+        <div class="footer-nav">
+            <a href="about.html">About</a><a href="music.html">Music</a><a href="podcast.html">Podcast</a><a href="videos.html">Videos</a><a href="tour.html">Tour</a><a href="gallery.html">Gallery</a><a href="merch.html">Merch</a><a href="news.html">News</a><a href="contact.html">Contact</a><a href="admin.html">Admin</a><a href="#" onclick="openCookieSettings(); return false;">Cookie Settings</a>
+        </div>
+        <p class="fine">&copy; 2024 p2k-music.ca — All rights reserved. Professional Artist Portfolio &amp; Music Platform.</p>
+    </footer>
+
+    <script src="assets/app.js"></script>
+</body>
+</html>

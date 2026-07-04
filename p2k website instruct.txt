@@ -1,0 +1,24 @@
+p2k website instruct:
+
+On it. I'll package the website files (plus the setup guide and your original backup as a safety net) into a clean, nested zip in your Downloads folder — and verify its contents.
+
+Done. Your zip is ready in your Downloads folder:
+
+**`C:\Users\p2k\Downloads\p2k-music-website.zip`** (66 KB)
+
+Everything nests cleanly under a `p2k-music-website/` folder so it extracts tidily:
+
+| File | What it is |
+|---|---|
+| **index.html** (227 KB) | The complete site — every feature we built (music, tickets, check-in, merch, podcast, ads, cookie consent, profit dashboard) |
+| **ads.txt** | AdSense authorization — must sit at the live domain root |
+| **ADSENSE-SETUP.md** | Step-by-step guide for turning on ads |
+| **index.original.backup.html** | P2K's untouched original, as a safety net |
+
+**Two quick notes for when P2K deploys it:**
+- Only **index.html** + **ads.txt** need to go live. The guide and backup are just for reference — he can delete `index.original.backup.html` before publishing if he doesn't want the old version publicly reachable.
+- The zip has **no `audio/` folder** — that's P2K's actual song/podcast files, which live on his side. Once he drops that folder in next to `index.html` on the server, the music catalog and episodes light up automatically (the code already looks for them).
+
+To deploy: unzip, drop the folder on any static host (GitHub Pages, Netlify, Vercel — all free), add the `audio/` folder, and it's live.
+
+Want me to also throw in a short **README** (how to deploy + the admin passcode reminder) inside the zip, or are you all set?

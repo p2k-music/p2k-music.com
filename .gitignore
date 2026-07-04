@@ -1,0 +1,14 @@
+# OS / editor cruft
+Thumbs.db
+ehthumbs.db
+.DS_Store
+Desktop.ini
+*.swp
+*~
+
+# Local tooling (safe to keep out of the backup)
+.claude/settings.local.json
+
+# NOTE: the audio/ folder is intentionally NOT ignored — the whole point of the
+# backup is to save P2K's tracks. Make sure audio/ holds the REAL .mp3/.mp4 files
+# (not the 1-byte preview placeholders) before running a backup you care about.
