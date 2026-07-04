@@ -1,3 +1,6 @@
+# Build artifacts / downloads (regenerable — keep out of the backup)
+*.zip
+
 # OS / editor cruft
 Thumbs.db
 ehthumbs.db
