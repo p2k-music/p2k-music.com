@@ -1,10 +1,23 @@
-        const ADMIN_PASSCODE = '199430';
+        // NOTE: admin auth is now verified SERVER-SIDE (POST /api/admin/login).
+        // The passcode never lives in client code anymore — see server/auth.js.
         const STORAGE_KEY = 'p2kMusicAdmin';
         const DB_NAME = 'p2kMusicDB';
         const DB_VERSION = 6;
         const SONG_PRICE = 16;
         const PREVIEW_SECONDS = 30;
         const PAYPAL_EMAIL = 'p2key1@gmail.com';
+
+        // ── Backend API helper (same-origin; the session travels in an HttpOnly cookie) ──
+        const API_BASE = '';
+        let csrfToken = null;
+        async function api(method, path, body) {
+            const opts = { method, credentials: 'same-origin', headers: {} };
+            if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+            if (csrfToken && method !== 'GET') opts.headers['X-CSRF-Token'] = csrfToken;
+            const res = await fetch(API_BASE + path, opts);
+            let data = null; try { data = await res.json(); } catch (e) {}
+            return { ok: res.ok, status: res.status, data };
+        }
 
         const DEFAULT_SONGS = [
             { id: 1, title: "Bluntedp2k beats", file: "audio/Bluntedp2k beats .mp3", duration: "--:--" },
@@ -322,36 +335,47 @@
             document.getElementById('passcodeInput').value = '';
         }
 
-        function handleAdminLogin(event) {
+        async function handleAdminLogin(event) {
             event.preventDefault();
             const passcode = document.getElementById('passcodeInput').value;
             const errorDiv = document.getElementById('loginError');
-
-            if (passcode === ADMIN_PASSCODE) {
-                isAdmin = true;
-                localStorage.setItem(STORAGE_KEY, 'true');
-                updateAdminUI();
-                hideAdminLogin();
-                showNotification('Admin access granted');
-            } else {
-                errorDiv.textContent = 'Invalid passcode';
+            try {
+                const r = await api('POST', '/api/admin/login', { passcode });
+                if (r.ok && r.data && r.data.ok) {
+                    isAdmin = true;
+                    csrfToken = r.data.csrf;
+                    updateAdminUI();
+                    hideAdminLogin();
+                    showNotification('Admin access granted');
+                    return;
+                }
+                errorDiv.textContent = (r.status === 429) ? 'Too many attempts — wait a moment' : 'Invalid passcode';
                 errorDiv.style.display = 'block';
                 document.getElementById('passcodeInput').value = '';
+            } catch (e) {
+                errorDiv.textContent = 'Cannot reach the server — is the backend running?';
+                errorDiv.style.display = 'block';
             }
         }
 
-        function logout() {
+        async function logout() {
+            try { await api('POST', '/api/admin/logout'); } catch (e) {}
             isAdmin = false;
-            localStorage.removeItem(STORAGE_KEY);
+            csrfToken = null;
             updateAdminUI();
             showNotification('Logged out');
         }
 
-        function checkAdminStatus() {
-            if (localStorage.getItem(STORAGE_KEY) === 'true') {
-                isAdmin = true;
-                updateAdminUI();
-            }
+        // Trust the server's HttpOnly session cookie — never a client-set flag.
+        async function checkAdminStatus() {
+            try {
+                const r = await api('GET', '/api/admin/session');
+                if (r.ok && r.data && r.data.admin) {
+                    isAdmin = true;
+                    csrfToken = r.data.csrf;
+                    updateAdminUI();
+                }
+            } catch (e) { /* backend unreachable — remain a normal visitor */ }
         }
 
         // FILE UPLOADS - stored in IndexedDB for persistence
@@ -849,11 +873,23 @@
         }
 
         async function confirmPurchase(songId) {
+            const song = songs.find(s => s.id === songId);
+            // Verify + record the sale server-side. DEMO mode simulates the capture;
+            // LIVE mode confirms the payment with PayPal before unlocking.
+            try {
+                const ord = await api('POST', '/api/orders', { kind: 'song', ref: String(songId), title: song ? song.title : 'Track' });
+                if (ord.ok && ord.data && ord.data.orderId) {
+                    const cap = await api('POST', '/api/orders/' + ord.data.orderId + '/capture', {});
+                    if (!(cap.ok && cap.data && cap.data.paid)) {
+                        showNotification('Payment not verified yet — finish PayPal checkout, then click again');
+                        return;
+                    }
+                }
+            } catch (e) { /* backend offline — fall back to local unlock */ }
             purchasedSongs.add(songId);
             await dbPut('purchases', { songId: songId, date: new Date().toISOString() });
             closePaypalModal();
             renderSongs();
-            const song = songs.find(s => s.id === songId);
             logRevenue('music', song ? song.title : 'Track', SONG_PRICE);
             showNotification('Purchased "' + (song ? song.title : 'track') + '" - you can now play & download the full track!');
         }
@@ -1204,19 +1240,37 @@
             const cap = Number(ev.capacity) || 0, sold = Number(ev.sold) || 0;
             if (cap > 0 && sold >= cap) { showNotification('Sorry, this show just sold out'); return; }
 
-            const ticket = {
-                id: genTicketCode(ev),
-                eventId: ev.id,
-                eventTitle: ev.title,
-                eventDate: ev.date,
-                venue: ev.venue || '',
-                city: ev.city || '',
-                holder: holder,
-                email: email,
-                price: Number(ev.price) || 0,
-                purchasedAt: new Date().toISOString(),
-                status: 'valid'
-            };
+            // Issue the ticket SERVER-SIDE so it is signed and validatable at the door
+            // from any device. Falls back to local generation if the backend is offline.
+            let ticket = null;
+            try {
+                const ord = await api('POST', '/api/orders', {
+                    kind: 'ticket', ref: String(ev.id), title: ev.title, price: Number(ev.price) || 0,
+                    holder: holder, email: email, eventDate: ev.date, venue: ev.venue || '', city: ev.city || ''
+                });
+                if (ord.ok && ord.data && ord.data.orderId) {
+                    const cap = await api('POST', '/api/orders/' + ord.data.orderId + '/capture', {});
+                    if (cap.ok && cap.data && cap.data.paid && cap.data.ticket) {
+                        const st = cap.data.ticket;
+                        ticket = {
+                            id: st.code, eventId: ev.id, eventTitle: st.eventTitle || ev.title, eventDate: st.eventDate || ev.date,
+                            venue: st.venue || ev.venue || '', city: st.city || ev.city || '', holder: st.holder || holder,
+                            email: st.email || email, price: Number(st.price) || 0, purchasedAt: new Date().toISOString(),
+                            status: st.status || 'valid', serverIssued: true
+                        };
+                    } else if (cap.data && cap.data.paid === false) {
+                        showNotification('Payment not verified yet — finish PayPal checkout, then try again');
+                        return;
+                    }
+                }
+            } catch (e) { /* backend offline — generate locally below */ }
+            if (!ticket) {
+                ticket = {
+                    id: genTicketCode(ev), eventId: ev.id, eventTitle: ev.title, eventDate: ev.date,
+                    venue: ev.venue || '', city: ev.city || '', holder: holder, email: email,
+                    price: Number(ev.price) || 0, purchasedAt: new Date().toISOString(), status: 'valid'
+                };
+            }
 
             ev.sold = sold + 1;
             await dbPut('tickets', ticket);
@@ -1340,15 +1394,37 @@
             input.value = '';
         }
 
+        // Shape a server ticket payload into what renderCheckinResult expects
+        function srvTicket(t, code) {
+            return { id: code, holder: t.holder, eventTitle: t.event_title, eventDate: t.event_date, checkedInAt: t.checked_in_at };
+        }
+
         async function doCheckIn(raw) {
             const code = extractCode(raw);
             if (!code) return;
+
+            // Prefer the SERVER: validates + marks used cross-device (the door scanner
+            // no longer needs the ticket to live in its own browser).
+            try {
+                const look = await api('GET', '/api/ticket/' + encodeURIComponent(code));
+                if (look.ok && look.data) {
+                    const t = look.data;
+                    if (t.forged) { renderCheckinResult('invalid', null, code); return; }
+                    if (t.status === 'checked-in') { renderCheckinResult('used', srvTicket(t, code), code); return; }
+                    if (t.status === 'void') { renderCheckinResult('invalid', null, code); return; }
+                    const chk = await api('POST', '/api/ticket/' + encodeURIComponent(code) + '/checkin');
+                    if (chk.ok && chk.data && chk.data.ok) { renderCheckinResult('valid', srvTicket(t, code), code); await loadCheckinLog(); return; }
+                    if (chk.data && chk.data.alreadyUsed) { renderCheckinResult('used', srvTicket(chk.data, code), code); return; }
+                    renderCheckinResult('invalid', null, code); return;
+                }
+                // 404 → not a server ticket; fall through to the local store
+            } catch (e) { /* backend unreachable — fall back to local tickets */ }
+
+            // Fallback: this device's own IndexedDB tickets (offline / no backend)
             let ticket = await dbGet('tickets', code);
             if (!ticket) ticket = (myTickets || []).find(t => t.id === code) || null;
-
             if (!ticket) { renderCheckinResult('invalid', null, code); return; }
             if (ticket.status === 'checked-in') { renderCheckinResult('used', ticket, code); return; }
-
             ticket.status = 'checked-in';
             ticket.checkedInAt = new Date().toISOString();
             await dbPut('tickets', ticket);
@@ -1815,12 +1891,8 @@
           }
 
           try {
-            const res = await fetch('/api/withdraw', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ amount: amt })
-            });
-            const data = await res.json();
+            const r = await api('POST', '/api/withdraw', { amount: amt });
+            const data = r.data || {};
 
             if (data.success) {
               walletBalance -= amt;
@@ -1987,45 +2059,69 @@
             if (!canvas) return;
             const ctx = canvas.getContext('2d');
             let w, h, particles = [];
+            // Palette-matched glow colours (cyan / violet / magenta / coral / gold)
+            const PAL = [[0,212,255],[124,58,237],[255,45,149],[255,107,107],[255,196,57]];
             const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+            const mouse = { x: -9999, y: -9999, active: false };
             function resize() {
                 w = canvas.width = window.innerWidth;
                 h = canvas.height = window.innerHeight;
-                const count = Math.min(90, Math.floor(w * h / 18000));
-                particles = Array.from({ length: count }, () => ({
-                    x: Math.random() * w, y: Math.random() * h,
-                    vx: (Math.random() - 0.5) * 0.4, vy: (Math.random() - 0.5) * 0.4,
-                    r: Math.random() * 1.8 + 0.6
-                }));
+                const count = Math.min(110, Math.floor(w * h / 16000));
+                particles = Array.from({ length: count }, () => {
+                    const c = PAL[Math.floor(Math.random() * PAL.length)];
+                    return {
+                        x: Math.random() * w, y: Math.random() * h,
+                        vx: (Math.random() - 0.5) * 0.35, vy: (Math.random() - 0.5) * 0.35,
+                        r: Math.random() * 1.9 + 0.6, c,
+                        tw: Math.random() * Math.PI * 2  // twinkle phase
+                    };
+                });
             }
             function draw() {
                 ctx.clearRect(0, 0, w, h);
+                ctx.globalCompositeOperation = 'lighter';  // additive glow
                 for (let i = 0; i < particles.length; i++) {
                     const p = particles[i];
+                    // gentle drift + soft repulsion from the cursor for interactivity
+                    if (mouse.active) {
+                        const mdx = p.x - mouse.x, mdy = p.y - mouse.y;
+                        const md = Math.hypot(mdx, mdy);
+                        if (md < 140 && md > 0.1) { const f = (140 - md) / 140 * 0.6; p.vx += (mdx / md) * f * 0.08; p.vy += (mdy / md) * f * 0.08; }
+                    }
+                    p.vx *= 0.99; p.vy *= 0.99;                 // damping so pushes settle
                     p.x += p.vx; p.y += p.vy;
                     if (p.x < 0 || p.x > w) p.vx *= -1;
                     if (p.y < 0 || p.y > h) p.vy *= -1;
+                    p.tw += 0.03;
+                    const a = 0.45 + 0.35 * Math.sin(p.tw);     // twinkle
                     ctx.beginPath();
                     ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
-                    ctx.fillStyle = 'rgba(0,212,255,0.6)';
+                    ctx.fillStyle = `rgba(${p.c[0]},${p.c[1]},${p.c[2]},${a})`;
+                    ctx.shadowColor = `rgba(${p.c[0]},${p.c[1]},${p.c[2]},0.9)`;
+                    ctx.shadowBlur = 8;
                     ctx.fill();
                     for (let j = i + 1; j < particles.length; j++) {
                         const q = particles[j];
                         const dx = p.x - q.x, dy = p.y - q.y;
                         const dist = Math.sqrt(dx * dx + dy * dy);
-                        if (dist < 120) {
+                        if (dist < 130) {
                             ctx.beginPath();
                             ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y);
-                            ctx.strokeStyle = `rgba(124,58,237,${0.14 * (1 - dist / 120)})`;
-                            ctx.lineWidth = 1;
+                            // tint the link with this node's colour, fading with distance
+                            ctx.strokeStyle = `rgba(${p.c[0]},${p.c[1]},${p.c[2]},${0.16 * (1 - dist / 130)})`;
+                            ctx.lineWidth = 1; ctx.shadowBlur = 0;
                             ctx.stroke();
                         }
                     }
                 }
+                ctx.shadowBlur = 0;
+                ctx.globalCompositeOperation = 'source-over';
                 requestAnimationFrame(draw);
             }
             resize();
             window.addEventListener('resize', resize);
+            window.addEventListener('mousemove', (e) => { mouse.x = e.clientX; mouse.y = e.clientY; mouse.active = true; }, { passive: true });
+            window.addEventListener('mouseout', () => { mouse.active = false; mouse.x = mouse.y = -9999; });
             if (!reduce) draw();
         }
 
@@ -2283,16 +2379,40 @@
         function startSwirl() { ensurePlayerSwirl(); const c = document.getElementById('playerSwirl'); if (c) c.classList.add('on'); cancelAnimationFrame(swirlRAF); drawSwirl(); }
         function stopSwirl() { cancelAnimationFrame(swirlRAF); swirlRAF = null; const c = document.getElementById('playerSwirl'); if (c) { c.classList.remove('on'); const x = c.getContext('2d'); if (x) x.clearRect(0, 0, c.width, c.height); } }
 
-        // ================= Flowing ribbon wallpaper (every page) =================
-        function injectRibbons() {
-            if (document.getElementById('ribbonBg')) return;
+        // ============ Aurora nebula wallpaper (every page) ============
+        // Re-envisioned 2026-07-06: drifting colour orbs replace the old ribbons.
+        function injectAuroraField() {
+            if (document.getElementById('auroraField')) return;
+            // Clean up any legacy ribbon node from cached markup
+            const legacy = document.getElementById('ribbonBg');
+            if (legacy) legacy.remove();
             const bg = document.createElement('div');
-            bg.id = 'ribbonBg';
+            bg.id = 'auroraField';
             bg.setAttribute('aria-hidden', 'true');
-            bg.innerHTML = '<div class="ribbon r1"></div><div class="ribbon r2"></div><div class="ribbon r3"></div><div class="ribbon r4"></div><div class="ribbon r5"></div><div class="ribbon r6"></div>';
+            bg.innerHTML = '<div class="orb o1"></div><div class="orb o2"></div><div class="orb o3"></div><div class="orb o4"></div><div class="orb o5"></div><div class="orb o6"></div>';
             document.body.insertBefore(bg, document.body.firstChild);
         }
 
-        injectRibbons();
+        injectAuroraField();
+
+        // Add the "Converter" tool link into the shared nav + footer (every page)
+        function injectConverterNav() {
+            const nav = document.getElementById('navLinks');
+            if (nav && !nav.querySelector('[data-nav="converter"]')) {
+                const li = document.createElement('li');
+                li.innerHTML = '<a class="navlink" data-nav="converter" href="converter/index.html">Converter</a>';
+                const contactLi = nav.querySelector('[data-nav="contact"]');
+                if (contactLi && contactLi.parentElement) nav.insertBefore(li, contactLi.parentElement);
+                else nav.appendChild(li);
+            }
+            document.querySelectorAll('.footer-nav').forEach(fn => {
+                if (!fn.querySelector('a[href*="converter/"]')) {
+                    const a = document.createElement('a');
+                    a.href = 'converter/index.html'; a.textContent = 'Converter';
+                    fn.appendChild(a);
+                }
+            });
+        }
+        injectConverterNav();
         initLibrary();
         ensurePlayerSwirl();

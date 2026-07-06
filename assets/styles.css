@@ -86,10 +86,17 @@
             background-size: cover;
             background-position: center;
             background-attachment: fixed;
-            opacity: 0.18;
-            z-index: -1;
+            opacity: 0.5;              /* ribbon photo — muted by the dark base so text stays readable */
+            z-index: -2;               /* sits behind the particle motion */
             transition: all 0.6s ease;
             pointer-events: none;
+        }
+        /* Readability scrim over the photo so light text/nav/hero stay legible */
+        .custom-bg::after {
+            content: "";
+            position: absolute; inset: 0;
+            background:
+                linear-gradient(180deg, rgba(5,6,13,0.72) 0%, rgba(5,6,13,0.35) 30%, rgba(5,6,13,0.45) 70%, rgba(5,6,13,0.8) 100%);
         }
 
         /* Particle canvas */
@@ -1345,6 +1352,7 @@ body[data-page="videos"]  .navlink[data-nav="videos"],
 body[data-page="tour"]    .navlink[data-nav="tour"],
 body[data-page="gallery"] .navlink[data-nav="gallery"],
 body[data-page="merch"]   .navlink[data-nav="merch"],
+body[data-page="converter"] .navlink[data-nav="converter"],
 body[data-page="contact"] .navlink[data-nav="contact"] {
     background: linear-gradient(120deg, rgba(0, 212, 255, 0.24), rgba(255, 107, 107, 0.22));
     color: #fff;
@@ -1386,28 +1394,63 @@ body[data-page="contact"] .navlink[data-nav="contact"] {
 
 
 /* ============================================================
-   FLOWING RIBBON WALLPAPER  (every page, animated, behind content)
+   AURORA NEBULA WALLPAPER  (every page, animated, behind content)
+   Re-envisioned 2026-07-06: drifting colour orbs on organic paths
+   + depth vignette replace the old flat horizontal ribbons.
    ============================================================ */
-#ribbonBg { position: fixed; inset: 0; z-index: -2; overflow: hidden; pointer-events: none; }
-#ribbonBg .ribbon {
-    position: absolute; left: -25%; width: 150%; height: 17vh;
-    filter: blur(30px); opacity: 0.42; border-radius: 50%;
+#auroraField { position: fixed; inset: 0; z-index: -2; overflow: hidden; pointer-events: none; }
+#auroraField .orb {
+    position: absolute; border-radius: 50%;
+    filter: blur(64px); opacity: 0.6;
     mix-blend-mode: screen; will-change: transform;
 }
-#ribbonBg .ribbon.r1 { top: 4%;  background: linear-gradient(90deg, transparent, #ff5e1a, #ff8c00, transparent); animation: ribbonFlow 26s ease-in-out infinite; }
-#ribbonBg .ribbon.r2 { top: 19%; background: linear-gradient(90deg, transparent, #ffb703, #ffd166, transparent); animation: ribbonFlow 33s ease-in-out infinite reverse; }
-#ribbonBg .ribbon.r3 { top: 35%; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.85), rgba(210,235,255,0.6), transparent); animation: ribbonFlow 29s ease-in-out infinite; }
-#ribbonBg .ribbon.r4 { top: 52%; background: linear-gradient(90deg, transparent, #4cc9f0, #4895ef, transparent); animation: ribbonFlow 35s ease-in-out infinite reverse; }
-#ribbonBg .ribbon.r5 { top: 69%; background: linear-gradient(90deg, transparent, #3a86ff, #1d3b8b, transparent); animation: ribbonFlow 27s ease-in-out infinite; }
-#ribbonBg .ribbon.r6 { top: 85%; background: linear-gradient(90deg, transparent, #0b1b4d, #16265f, transparent); animation: ribbonFlow 37s ease-in-out infinite reverse; }
-@keyframes ribbonFlow {
-    0%   { transform: translateX(-7%) translateY(0)     skewY(-2.5deg); }
-    50%  { transform: translateX(7%)  translateY(2.4vh) skewY(2.5deg); }
-    100% { transform: translateX(-7%) translateY(0)     skewY(-2.5deg); }
+/* each orb: size, anchor, palette colour + its own slow drift path */
+#auroraField .orb.o1 { width: 46vw; height: 46vw; top: -10%; left: -8%;
+    background: radial-gradient(circle at 32% 30%, rgba(0,212,255,0.95), rgba(0,212,255,0) 70%);
+    animation: orbDrift1 34s ease-in-out infinite; }
+#auroraField .orb.o2 { width: 42vw; height: 42vw; top: 4%;  left: 60%;
+    background: radial-gradient(circle at 32% 30%, rgba(124,58,237,0.9),  rgba(124,58,237,0) 70%);
+    animation: orbDrift2 45s ease-in-out infinite; }
+#auroraField .orb.o3 { width: 54vw; height: 54vw; top: 46%; left: 56%;
+    background: radial-gradient(circle at 32% 30%, rgba(255,45,149,0.85), rgba(255,45,149,0) 70%);
+    animation: orbDrift3 39s ease-in-out infinite; }
+#auroraField .orb.o4 { width: 46vw; height: 46vw; top: 54%; left: -10%;
+    background: radial-gradient(circle at 32% 30%, rgba(255,107,107,0.8), rgba(255,107,107,0) 70%);
+    animation: orbDrift4 50s ease-in-out infinite; }
+#auroraField .orb.o5 { width: 30vw; height: 30vw; top: 26%; left: 28%;
+    background: radial-gradient(circle at 32% 30%, rgba(255,196,57,0.55), rgba(255,196,57,0) 70%);
+    animation: orbDrift5 56s ease-in-out infinite; }
+#auroraField .orb.o6 { width: 38vw; height: 38vw; top: 72%; left: 30%;
+    background: radial-gradient(circle at 32% 30%, rgba(72,149,239,0.75), rgba(72,149,239,0) 70%);
+    animation: orbDrift6 42s ease-in-out infinite; }
+
+@keyframes orbDrift1 { 0%,100% { transform: translate(0,0) scale(1); }    50% { transform: translate(18vw,10vh) scale(1.25); } }
+@keyframes orbDrift2 { 0%,100% { transform: translate(0,0) scale(1); }    50% { transform: translate(-16vw,14vh) scale(0.85); } }
+@keyframes orbDrift3 { 0%,100% { transform: translate(0,0) scale(1); }    50% { transform: translate(-20vw,-12vh) scale(1.2); } }
+@keyframes orbDrift4 { 0%,100% { transform: translate(0,0) scale(1); }    50% { transform: translate(16vw,-14vh) scale(0.9); } }
+@keyframes orbDrift5 { 0%,100% { transform: translate(0,0) scale(0.9); }  50% { transform: translate(12vw,-8vh) scale(1.35); } }
+@keyframes orbDrift6 { 0%,100% { transform: translate(0,0) scale(1.1); }  50% { transform: translate(-14vw,-10vh) scale(0.8); } }
+
+/* depth vignette — frames the page and adds premium edge falloff */
+#auroraField::after {
+    content: ""; position: absolute; inset: 0;
+    background: radial-gradient(125% 95% at 50% 38%, transparent 52%, rgba(3,4,10,0.6) 100%);
 }
-/* let the ribbons read through: soften the flat aurora a touch */
-body::before { opacity: 0.85; }
-@media (prefers-reduced-motion: reduce) { #ribbonBg .ribbon { animation: none; } }
+
+/* living base aurora: drift + a slow saturation/hue "breath" */
+body::before {
+    opacity: 0.92;
+    animation: auroraDrift 24s ease-in-out infinite alternate,
+               auroraBreathe 20s ease-in-out infinite;
+}
+@keyframes auroraBreathe {
+    0%,100% { filter: saturate(1.25) brightness(1.05) hue-rotate(0deg); }
+    50%     { filter: saturate(1.55) brightness(1.2)  hue-rotate(16deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+    #auroraField .orb { animation: none; }
+    body::before { animation: none; }
+}
 
 /* ============================================================
    MUSIC LIBRARY BAR  (search / count / sort)
@@ -1438,6 +1481,5 @@ body::before { opacity: 0.85; }
 .floating-music > div { position: relative; z-index: 1; }
 .floating-music.playing #currentSongTitle { text-shadow: 0 1px 6px rgba(0, 0, 0, 0.9); }
 
-/* ribbon wallpaper: a touch more presence */
-#ribbonBg .ribbon { opacity: 0.55; filter: blur(26px); }
-body::before { opacity: 0.55; }
+/* aurora nebula dialed back to a faint colour ambience behind the ribbon photo */
+#auroraField .orb { opacity: 0.3; }
