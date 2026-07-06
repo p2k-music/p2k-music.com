@@ -125,7 +125,8 @@ function resolveSafe(urlPath) {
 function isBlocked(abs) {
   const rel = path.relative(config.rootDir, abs).replace(/\\/g, '/');
   if (rel.startsWith('server/') || rel === 'server') return true;
-  if (rel.split('/').some((seg) => seg.startsWith('.'))) return true; // .git, .env, .claude…
+  if (rel.split('/').some((seg) => seg.startsWith('.'))) return true; // .git, .env, .claude, .project-memory…
+  if (rel.toLowerCase().endsWith('.md')) return true;                 // internal docs — never web-served
   return false;
 }
 
