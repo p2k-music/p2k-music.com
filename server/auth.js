@@ -67,9 +67,9 @@ function verify(token) {
 }
 
 // ---- sessions & visitors ------------------------------------------------
-function issueAdminSession() {
+function issueAdminSession(adminEmail) {
   const now = Date.now();
-  return sign({ r: 'admin', iat: now, exp: now + config.sessionTtlMs, n: crypto.randomBytes(8).toString('hex') });
+  return sign({ r: 'admin', e: adminEmail || null, iat: now, exp: now + config.sessionTtlMs, n: crypto.randomBytes(8).toString('hex') });
 }
 function readAdminSession(token) {
   const o = verify(token);

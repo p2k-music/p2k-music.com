@@ -89,7 +89,32 @@ db.exec(`
     count INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (ip, day)
   );
+
+  -- Admin accounts (two logins) — password verified server-side (scrypt)
+  CREATE TABLE IF NOT EXISTS admins (
+    email        TEXT PRIMARY KEY,
+    pass_hash    TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    fail_count   INTEGER NOT NULL DEFAULT 0,
+    locked_until INTEGER NOT NULL DEFAULT 0
+  );
+
+  -- One-time 2FA login codes (emailed), hashed, short-lived, attempt-capped
+  CREATE TABLE IF NOT EXISTS login_codes (
+    id         TEXT PRIMARY KEY,        -- challenge id
+    email      TEXT NOT NULL,
+    code_hash  TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    used       INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+  );
 `);
+
+// Defensive migration: add lockout columns to admins DBs created before they existed
+for (const col of ['fail_count', 'locked_until']) {
+  try { db.exec(`ALTER TABLE admins ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`); } catch (_) { /* already present */ }
+}
 
 // ---- kv helpers ---------------------------------------------------------
 const _kvGet = db.prepare('SELECT v FROM kv WHERE k = ?');

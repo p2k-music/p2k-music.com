@@ -324,36 +324,90 @@
         }
 
         // ADMIN LOGIN
+        let pendingChallenge = null;
+
         function showAdminLogin() {
             document.getElementById('adminLoginModal').classList.add('show');
-            document.getElementById('passcodeInput').focus();
+            resetAdminLogin();
+            const em = document.getElementById('adminEmail'); if (em) em.focus();
         }
 
         function hideAdminLogin() {
             document.getElementById('adminLoginModal').classList.remove('show');
-            document.getElementById('loginError').style.display = 'none';
-            document.getElementById('passcodeInput').value = '';
+            resetAdminLogin();
         }
 
+        // Return the modal to step 1 (email + password)
+        function resetAdminLogin() {
+            pendingChallenge = null;
+            const s1 = document.getElementById('loginStep1'), s2 = document.getElementById('loginStep2');
+            if (s1) s1.style.display = '';
+            if (s2) s2.style.display = 'none';
+            const err = document.getElementById('loginError'); if (err) err.style.display = 'none';
+            const pw = document.getElementById('adminPassword'); if (pw) pw.value = '';
+            const cd = document.getElementById('adminCode'); if (cd) cd.value = '';
+        }
+
+        // Step 1: email + password → server emails a one-time code
         async function handleAdminLogin(event) {
             event.preventDefault();
-            const passcode = document.getElementById('passcodeInput').value;
+            const email = document.getElementById('adminEmail').value.trim();
+            const password = document.getElementById('adminPassword').value;
             const errorDiv = document.getElementById('loginError');
+            const btn = document.getElementById('loginContinueBtn');
+            errorDiv.style.display = 'none';
+            if (btn) { btn.disabled = true; btn.textContent = 'Sending code…'; }
             try {
-                const r = await api('POST', '/api/admin/login', { passcode });
+                const r = await api('POST', '/api/admin/login', { email, password });
+                if (r.ok && r.data && r.data.ok) {
+                    pendingChallenge = r.data.challenge;
+                    document.getElementById('loginStep1').style.display = 'none';
+                    document.getElementById('loginStep2').style.display = '';
+                    const msg = document.getElementById('loginSentMsg');
+                    if (r.data.demo && r.data.demoCode) {
+                        msg.innerHTML = 'Demo mode (email not set up) — your code is <b style="color:var(--cyan); letter-spacing:3px; font-size:1.1rem;">' + r.data.demoCode + '</b>';
+                    } else {
+                        msg.textContent = 'We emailed a 6-digit code to ' + (r.data.sentTo || 'your email') + '. Enter it below.';
+                    }
+                    const cd = document.getElementById('adminCode'); if (cd) cd.focus();
+                } else {
+                    const err = r.data && r.data.error;
+                    if (err === 'email_not_configured') errorDiv.textContent = 'Login email isn’t set up on the server yet — codes can’t be sent.';
+                    else if (err === 'locked') errorDiv.textContent = 'Account locked — try again in ' + (r.data.retryInMin || 15) + ' min';
+                    else errorDiv.textContent = (r.status === 429) ? 'Too many attempts — wait a moment' : 'Invalid email or password';
+                    errorDiv.style.display = 'block';
+                }
+            } catch (e) {
+                errorDiv.textContent = 'Cannot reach the server — is the backend running?';
+                errorDiv.style.display = 'block';
+            } finally {
+                if (btn) { btn.disabled = false; btn.textContent = 'Continue'; }
+            }
+        }
+
+        // Step 2: verify the emailed code → admin session
+        async function handleAdminVerify(event) {
+            event.preventDefault();
+            const code = document.getElementById('adminCode').value.trim();
+            const errorDiv = document.getElementById('loginError');
+            errorDiv.style.display = 'none';
+            try {
+                const r = await api('POST', '/api/admin/verify', { challenge: pendingChallenge, code });
                 if (r.ok && r.data && r.data.ok) {
                     isAdmin = true;
                     csrfToken = r.data.csrf;
                     updateAdminUI();
                     hideAdminLogin();
-                    showNotification('Admin access granted');
+                    showNotification('Admin access granted' + (r.data.email ? ' — ' + r.data.email : ''));
                     return;
                 }
-                errorDiv.textContent = (r.status === 429) ? 'Too many attempts — wait a moment' : 'Invalid passcode';
+                if (r.data && r.data.error === 'code_expired') { errorDiv.textContent = 'Code expired — start again'; setTimeout(resetAdminLogin, 1400); }
+                else if (r.status === 429) { errorDiv.textContent = 'Too many attempts — start again'; setTimeout(resetAdminLogin, 1400); }
+                else { errorDiv.textContent = 'Invalid code' + (r.data && r.data.attemptsLeft != null ? ' (' + r.data.attemptsLeft + ' left)' : ''); }
                 errorDiv.style.display = 'block';
-                document.getElementById('passcodeInput').value = '';
+                const cd = document.getElementById('adminCode'); if (cd) cd.value = '';
             } catch (e) {
-                errorDiv.textContent = 'Cannot reach the server — is the backend running?';
+                errorDiv.textContent = 'Cannot reach the server';
                 errorDiv.style.display = 'block';
             }
         }

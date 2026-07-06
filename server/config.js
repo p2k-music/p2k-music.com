@@ -89,7 +89,35 @@ const config = {
   },
 
   bodyLimitBytes: num(env.BODY_LIMIT_BYTES, 256 * 1024), // 256KB JSON cap
+
+  // --- admin accounts (2 logins). Passwords via env, else generated + logged on first run ---
+  admins: [
+    { email: (env.ADMIN1_EMAIL || 'tajallatajalla2@gmail.com').toLowerCase(), pass: env.ADMIN1_PASS || '' },
+    { email: (env.ADMIN2_EMAIL || 'aaron.styles9393@gmail.com').toLowerCase(), pass: env.ADMIN2_PASS || '' },
+  ],
+
+  // --- 2FA email codes ---
+  codeTtlMs: num(env.CODE_TTL_MIN, 5) * 60 * 1000,   // one-time code lifetime
+  codeMaxAttempts: num(env.CODE_MAX_ATTEMPTS, 5),
+  // Surface the code on-screen instead of emailing it — ONLY honoured for
+  // localhost requests, for local dev. Off by default → the system FAILS CLOSED
+  // (no email configured = nobody can complete login). Never enable in production.
+  devShowCode: bool(env.DEV_SHOW_CODE, false),
+
+  // --- account lockout (brute-force defence, per admin) ---
+  lockThreshold: num(env.LOCK_THRESHOLD, 8),   // wrong-password tries before lock
+  lockMinutes: num(env.LOCK_MINUTES, 15),
+
+  // --- SMTP for sending the code (blank = DEMO: code surfaced on screen instead) ---
+  smtp: {
+    host: env.SMTP_HOST || 'smtp.gmail.com',
+    port: num(env.SMTP_PORT, 465),
+    user: env.SMTP_USER || '',
+    pass: env.SMTP_PASS || '',
+    from: env.SMTP_FROM || env.SMTP_USER || 'p2k-music.ca <no-reply@p2k-music.ca>',
+  },
 };
 
 config.mode = config.paypal.live ? 'live' : 'demo';
+config.emailLive = !!(config.smtp.user && config.smtp.pass);
 module.exports = config;

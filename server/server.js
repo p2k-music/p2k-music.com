@@ -13,8 +13,7 @@ const H = require('./http');
 const auth = require('./auth');
 const store = require('./db');
 const paypal = require('./paypal');
-
-auth.ensureAdminSeed();
+const email = require('./email');
 
 const d = (cents) => Math.round(cents) / 100;              // cents → dollars
 const today = () => new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
@@ -40,7 +39,36 @@ const q = {
   getIpDay: store.prepare('SELECT count FROM ip_day WHERE ip=? AND day=?'),
   upsertIpDay: store.prepare('INSERT INTO ip_day(ip,day,count) VALUES(?,?,1) ON CONFLICT(ip,day) DO UPDATE SET count=count+1'),
   incListen: store.prepare("INSERT INTO kv(k,v) VALUES('listen_minutes','1') ON CONFLICT(k) DO UPDATE SET v = CAST(v AS INTEGER)+1"),
+  getAdmin: store.prepare('SELECT * FROM admins WHERE email = ?'),
+  insAdmin: store.prepare('INSERT INTO admins(email,pass_hash,created_at) VALUES(?,?,?)'),
+  setAdminLock: store.prepare('UPDATE admins SET fail_count=?, locked_until=? WHERE email=?'),
+  insCode: store.prepare('INSERT INTO login_codes(id,email,code_hash,expires_at,attempts,used,created_at) VALUES(?,?,?,?,0,0,?)'),
+  getCode: store.prepare('SELECT * FROM login_codes WHERE id = ?'),
+  bumpCode: store.prepare('UPDATE login_codes SET attempts = attempts + 1 WHERE id = ?'),
+  useCode: store.prepare('UPDATE login_codes SET used = 1 WHERE id = ?'),
 };
+
+// Seed the two admin accounts on first run. Passwords from config (env) if set,
+// otherwise a strong one is generated and logged once (change it after).
+function ensureAdminsSeed() {
+  for (const a of config.admins) {
+    if (!a.email || q.getAdmin.get(a.email)) continue;
+    const pass = a.pass || crypto.randomBytes(6).toString('base64url');
+    q.insAdmin.run(a.email, auth.hashPasscode(pass), Date.now());
+    if (!a.pass) {
+      console.warn(`\x1b[33m[SECURITY] Seeded admin ${a.email} with a generated password: ${pass}\n` +
+        `  Set ADMIN1_PASS / ADMIN2_PASS in server/.env and reset server/data to choose your own.\x1b[0m`);
+    } else {
+      console.log(`  admin seeded: ${a.email}`);
+    }
+  }
+}
+ensureAdminsSeed();
+
+const genCode = () => String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+// Verify against this when an email is unknown, so timing doesn't reveal which emails exist.
+const DUMMY_HASH = auth.hashPasscode(crypto.randomBytes(8).toString('hex'));
+const isLoopback = (ip) => ['127.0.0.1', '::1', '::ffff:127.0.0.1', 'localhost'].includes(ip);
 
 // ---- cookies ------------------------------------------------------------
 function setCookie(res, name, value, maxAgeMs) {
@@ -99,16 +127,74 @@ async function handleApi(req, res, url) {
   }
 
   // ---- admin auth ----
+  // ---- admin auth step 1: email + password → email a one-time code ----
   if (p === '/api/admin/login' && m === 'POST') {
     if (!auth.rateLimit('login', ip)) return H.sendJson(res, 429, { error: 'rate_limited' });
     const body = await H.readJsonBody(req);
     if (body.error) return H.sendJson(res, 400, { error: body.error });
-    if (auth.checkAdminPasscode(str(body.passcode, 128))) {
-      const token = auth.issueAdminSession();
-      setCookie(res, 'p2k_s', token, config.sessionTtlMs);
-      return H.sendJson(res, 200, { ok: true, csrf: auth.csrfFor(token) });
+    const emailAddr = str(body.email, 160).trim().toLowerCase();
+    const password = str(body.password, 200);
+    const admin = emailAddr ? q.getAdmin.get(emailAddr) : null;
+    const now = Date.now();
+
+    // Account lockout after repeated wrong passwords
+    if (admin && admin.locked_until && now < admin.locked_until) {
+      return H.sendJson(res, 429, { ok: false, error: 'locked', retryInMin: Math.ceil((admin.locked_until - now) / 60000) });
     }
-    return H.sendJson(res, 401, { ok: false, error: 'invalid_passcode' });
+    // Always run one scrypt verify (real or dummy) so timing can't reveal which emails exist.
+    const ok = auth.verifyPasscode(password, admin ? admin.pass_hash : DUMMY_HASH);
+    if (!admin || !ok) {
+      if (admin) {
+        const fc = (admin.fail_count || 0) + 1;
+        if (fc >= config.lockThreshold) q.setAdminLock.run(0, now + config.lockMinutes * 60000, emailAddr);
+        else q.setAdminLock.run(fc, 0, emailAddr);
+      }
+      return H.sendJson(res, 401, { ok: false, error: 'invalid_credentials' });
+    }
+    if (admin.fail_count || admin.locked_until) q.setAdminLock.run(0, 0, emailAddr); // reset on success
+
+    const challenge = uid();
+    const code = genCode();
+    q.insCode.run(challenge, emailAddr, auth.hashPasscode(code), now + config.codeTtlMs, now);
+
+    // Deliver the code. FAIL CLOSED: it is only ever emailed to the real inbox.
+    // The on-screen fallback is honoured ONLY for localhost dev (config.devShowCode),
+    // so a remote attacker can never see the code even if the flag is left on.
+    let surfaced = null;
+    try {
+      const r = await email.sendLoginCode(emailAddr, code);
+      if (!r.sent) {
+        if (config.devShowCode && isLoopback(ip)) { surfaced = code; console.log(`[2FA DEV] localhost code for ${emailAddr}: ${code}`); }
+        else return H.sendJson(res, 503, { ok: false, error: 'email_not_configured' });
+      }
+    } catch (e) {
+      console.warn('[2FA] email send failed:', e.message);
+      return H.sendJson(res, 502, { ok: false, error: 'email_failed' });
+    }
+    return H.sendJson(res, 200, {
+      ok: true, challenge, sentTo: email.maskEmail(emailAddr),
+      demo: surfaced != null, demoCode: surfaced, // only ever set for a localhost dev session
+    });
+  }
+
+  // ---- admin auth step 2: verify the emailed code → issue the session ----
+  if (p === '/api/admin/verify' && m === 'POST') {
+    if (!auth.rateLimit('login', ip)) return H.sendJson(res, 429, { error: 'rate_limited' });
+    const body = await H.readJsonBody(req);
+    if (body.error) return H.sendJson(res, 400, { error: body.error });
+    const challenge = str(body.challenge, 64);
+    const code = str(body.code, 12).trim();
+    const row = q.getCode.get(challenge);
+    if (!row || row.used || Date.now() > row.expires_at) return H.sendJson(res, 400, { ok: false, error: 'code_expired' });
+    if (row.attempts >= config.codeMaxAttempts) { q.useCode.run(challenge); return H.sendJson(res, 429, { ok: false, error: 'too_many_attempts' }); }
+    q.bumpCode.run(challenge);
+    if (!auth.verifyPasscode(code, row.code_hash)) {
+      return H.sendJson(res, 401, { ok: false, error: 'invalid_code', attemptsLeft: Math.max(0, config.codeMaxAttempts - (row.attempts + 1)) });
+    }
+    q.useCode.run(challenge);
+    const token = auth.issueAdminSession(row.email);
+    setCookie(res, 'p2k_s', token, config.sessionTtlMs);
+    return H.sendJson(res, 200, { ok: true, csrf: auth.csrfFor(token), email: row.email });
   }
   if (p === '/api/admin/logout' && m === 'POST') {
     clearCookie(res, 'p2k_s');
@@ -116,7 +202,7 @@ async function handleApi(req, res, url) {
   }
   if (p === '/api/admin/session' && m === 'GET') {
     const a = getAdmin(req);
-    return H.sendJson(res, 200, a ? { admin: true, csrf: auth.csrfFor(a.token), mode: config.mode } : { admin: false });
+    return H.sendJson(res, 200, a ? { admin: true, csrf: auth.csrfFor(a.token), email: a.session.e || null, mode: config.mode } : { admin: false });
   }
 
   // ---- wallet: earnings (admin) ----
