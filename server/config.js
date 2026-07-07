@@ -40,7 +40,9 @@ const config = {
   port: num(env.PORT, 8123),
   host: env.HOST || '0.0.0.0',
   rootDir: path.resolve(__dirname, '..'),        // static site root (repo root)
-  dataDir: path.join(__dirname, 'data'),         // sqlite + runtime state
+  // sqlite + runtime state. Override with DATA_DIR on hosts where the persistent
+  // disk mounts elsewhere (e.g. /data on Render/Fly) — else the DB dies on redeploy.
+  dataDir: env.DATA_DIR ? path.resolve(env.DATA_DIR) : path.join(__dirname, 'data'),
   behindTLS: bool(env.BEHIND_TLS, false),        // set true when served over HTTPS (enables Secure cookies + HSTS)
   trustProxy: bool(env.TRUST_PROXY, false),      // honour X-Forwarded-For (only behind a trusted proxy)
 
@@ -54,11 +56,6 @@ const config = {
   listenRatePerMin: num(env.LISTEN_RATE_PER_MIN, 1.55 / 3),
 
   // --- admin auth ---
-  // First run seeds the admin passcode hash from P2K_ADMIN_PASSCODE (preferred).
-  // If unset, falls back to the legacy code so the demo works out-of-the-box —
-  // the server logs a loud warning telling P2K to set a real one.
-  seedPasscode: env.P2K_ADMIN_PASSCODE || '',
-  legacyPasscode: '199430',
   sessionTtlMs: num(env.SESSION_TTL_MIN, 240) * 60 * 1000,   // 4h sliding
   visitorTtlMs: num(env.VISITOR_TTL_MIN, 720) * 60 * 1000,   // 12h
 
@@ -89,6 +86,7 @@ const config = {
   },
 
   bodyLimitBytes: num(env.BODY_LIMIT_BYTES, 256 * 1024), // 256KB JSON cap
+  logRequests: bool(env.LOG_REQUESTS, true),             // structured API/error request log
 
   // --- admin accounts (2 logins). Passwords via env, else generated + logged on first run ---
   admins: [
@@ -120,4 +118,28 @@ const config = {
 
 config.mode = config.paypal.live ? 'live' : 'demo';
 config.emailLive = !!(config.smtp.user && config.smtp.pass);
+
+// ---- fail-fast validation: a misconfigured money site must not boot --------
+(function validate(c) {
+  const errs = [];
+  if (!Number.isInteger(c.port) || c.port < 1 || c.port > 65535) errs.push(`PORT must be 1-65535 (got ${c.port})`);
+  if (!/^[A-Z]{3}$/.test(c.currency)) errs.push(`CURRENCY must be a 3-letter ISO code (got "${c.currency}")`);
+  if (!(c.songPrice > 0)) errs.push(`SONG_PRICE must be > 0 (got ${c.songPrice})`);
+  if (!(c.minWithdraw > 0)) errs.push(`MIN_WITHDRAW must be > 0 (got ${c.minWithdraw})`);
+  if (!(c.listenRatePerMin >= 0)) errs.push(`LISTEN_RATE_PER_MIN must be >= 0 (got ${c.listenRatePerMin})`);
+  if (!(c.bodyLimitBytes >= 1024)) errs.push(`BODY_LIMIT_BYTES must be >= 1024 (got ${c.bodyLimitBytes})`);
+  if (env.PAYPAL_ENV === 'production' && !c.paypal.live) {
+    // Not fatal — DEMO mode must keep working out of the box — but the owner
+    // needs to know no real payments are happening despite the env setting.
+    console.warn('\x1b[33m[CONFIG] PAYPAL_ENV=production but PAYPAL_CLIENT_ID/PAYPAL_SECRET are missing — running in DEMO mode (payments simulated).\x1b[0m');
+  }
+  if (errs.length) {
+    console.error('\x1b[31m[CONFIG] Refusing to start — fix server/.env:\n  - ' + errs.join('\n  - ') + '\x1b[0m');
+    process.exit(1);
+  }
+  if (c.behindTLS === false && c.mode === 'live') {
+    console.warn('\x1b[33m[CONFIG] Live PayPal without BEHIND_TLS=true — cookies will not be Secure. Only OK behind a dev proxy.\x1b[0m');
+  }
+})(config);
+
 module.exports = config;

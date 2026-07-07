@@ -25,13 +25,13 @@ function cspValue() {
     "default-src 'self'",
     "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net " +
       "https://pagead2.googlesyndication.com https://*.googlesyndication.com https://*.doubleclick.net " +
-      "https://www.paypal.com https://*.paypal.com https://www.googletagservices.com https://*.google.com",
+      "https://www.paypal.com https://*.paypal.com https://*.paypalobjects.com https://www.googletagservices.com https://*.google.com",
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com",
     "font-src 'self' data: https://fonts.gstatic.com https://cdnjs.cloudflare.com",
     "img-src 'self' data: blob: https:",
     "media-src 'self' blob:",
     "connect-src 'self' https://*.paypal.com https://api-m.paypal.com https://api-m.sandbox.paypal.com " +
-      "https://api.qrserver.com https://*.googlesyndication.com https://*.doubleclick.net",
+      "https://*.paypalobjects.com https://api.qrserver.com https://*.googlesyndication.com https://*.doubleclick.net",
     "frame-src https://www.paypal.com https://*.paypal.com https://*.googlesyndication.com " +
       "https://*.doubleclick.net https://googleads.g.doubleclick.net",
     "object-src 'none'", "base-uri 'self'",
@@ -70,7 +70,10 @@ function parseCookies(req) {
   for (const part of raw.split(';')) {
     const i = part.indexOf('=');
     if (i === -1) continue;
-    out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    const val = part.slice(i + 1).trim();
+    // Malformed %-encoding in a hostile cookie must not 500 the whole request.
+    try { out[part.slice(0, i).trim()] = decodeURIComponent(val); }
+    catch (_) { out[part.slice(0, i).trim()] = val; }
   }
   return out;
 }
@@ -78,7 +81,8 @@ function parseCookies(req) {
 function sendJson(res, status, obj, headers) {
   const body = JSON.stringify(obj);
   securityHeaders(res);
-  res.writeHead(status, Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, headers || {}));
+  // API responses carry session/CSRF/earnings state — never cacheable.
+  res.writeHead(status, Object.assign({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }, headers || {}));
   res.end(body);
 }
 function sendText(res, status, text, headers) {
@@ -101,11 +105,32 @@ function readJsonBody(req) {
       const ct = String(req.headers['content-type'] || '');
       const raw = Buffer.concat(chunks).toString('utf8');
       if (ct.includes('application/json') || raw.trim().startsWith('{')) {
-        try { return resolve(JSON.parse(raw)); } catch (_) { return resolve({ error: 'bad_json' }); }
+        try {
+          const parsed = JSON.parse(raw);
+          // Handlers do property access on the result — reject non-object payloads
+          // (null / arrays / bare strings) instead of letting them 500 downstream.
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return resolve({ error: 'bad_json' });
+          return resolve(parsed);
+        } catch (_) { return resolve({ error: 'bad_json' }); }
       }
       resolve({ error: 'unsupported_type' });
     });
     req.on('error', () => resolve({ error: 'read_error' }));
+  });
+}
+
+// Read a raw request body with a hard size cap (returns null when over-cap
+// or on read error). Used where the exact bytes matter (webhook signatures).
+function readRawBody(req, limitBytes) {
+  return new Promise((resolve) => {
+    let size = 0; const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limitBytes) { resolve(null); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', () => resolve(null));
   });
 }
 
@@ -122,11 +147,13 @@ function resolveSafe(urlPath) {
 }
 
 // Never serve the backend's own source/data or dotfiles over HTTP.
+// Compared case-insensitively: Windows/macOS filesystems resolve /SERVER/… to
+// the same directory, so a case-sensitive check would be a trivial bypass.
 function isBlocked(abs) {
-  const rel = path.relative(config.rootDir, abs).replace(/\\/g, '/');
+  const rel = path.relative(config.rootDir, abs).replace(/\\/g, '/').toLowerCase();
   if (rel.startsWith('server/') || rel === 'server') return true;
   if (rel.split('/').some((seg) => seg.startsWith('.'))) return true; // .git, .env, .claude, .project-memory…
-  if (rel.toLowerCase().endsWith('.md')) return true;                 // internal docs — never web-served
+  if (rel.endsWith('.md')) return true;                               // internal docs — never web-served
   return false;
 }
 
@@ -195,5 +222,5 @@ function notFound(res) {
 
 module.exports = {
   securityHeaders, clientIp, parseCookies, sendJson, sendText,
-  readJsonBody, serveStatic, MIME, CSP,
+  readJsonBody, readRawBody, serveStatic, MIME, CSP,
 };

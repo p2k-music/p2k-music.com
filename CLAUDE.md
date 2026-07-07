@@ -39,7 +39,8 @@ right password** — set `SMTP_USER` + a Google App Password in `server/.env` to
 `DEV_SHOW_CODE=1` shows the code on-screen for localhost dev only.
 
 ## Current state / next steps
-- 2FA login is in **PR #1** (`admin-2fa-login`) — merge into `main`.
+- 2FA login (PR #1) is **merged into `main`**; a full audit + enterprise-hardening pass
+  landed 2026-07-06 (see `PROJECT-OVERVIEW.md` §13).
 - To make admin usable: configure SMTP. To take payments: add PayPal live creds. For
   production: HTTPS + `BEHIND_TLS=true`.
 - See `SECURITY-AUDIT.md` for the full go-live checklist and residual risks.

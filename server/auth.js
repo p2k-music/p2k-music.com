@@ -29,22 +29,6 @@ function verifyPasscode(pass, stored) {
   } catch (_) { return false; }
 }
 
-// Seed the admin passcode hash on first run (env-preferred, legacy fallback).
-function ensureAdminSeed() {
-  if (store.kvGet('admin_hash')) return;
-  const seed = config.seedPasscode || config.legacyPasscode;
-  store.kvSet('admin_hash', hashPasscode(seed));
-  if (!config.seedPasscode) {
-    console.warn('\x1b[33m[SECURITY] Admin passcode seeded from the LEGACY default. ' +
-      'Set P2K_ADMIN_PASSCODE in server/.env and restart to use a private code.\x1b[0m');
-  }
-}
-function checkAdminPasscode(pass) {
-  const h = store.kvGet('admin_hash');
-  return h ? verifyPasscode(pass, h) : false;
-}
-function setAdminPasscode(pass) { store.kvSet('admin_hash', hashPasscode(pass)); }
-
 // ---- signed token helpers (HMAC-SHA256) --------------------------------
 const b64u = (buf) => Buffer.from(buf).toString('base64url');
 function sign(payloadObj) {
@@ -124,7 +108,7 @@ setInterval(() => {
 }, 600_000).unref();
 
 module.exports = {
-  hashPasscode, verifyPasscode, ensureAdminSeed, checkAdminPasscode, setAdminPasscode,
+  hashPasscode, verifyPasscode,
   sign, verify, issueAdminSession, readAdminSession, issueVisitor, readVisitor,
   csrfFor, csrfOk, ticketSig, rateLimit,
 };

@@ -179,9 +179,10 @@ payouts, CSP + security headers, Range-streaming static server with traversal gu
 - **Rights/licensing:** some catalog tracks look like other artists'/remixes — selling
   them + running ads needs P2K to own/license them (legal, not code).
 - Residual security items (see audit): gate raw `audio/` download URLs (R2), server-side
-  event/merch pricing (R3), PayPal JS SDK for real capture (R4), listen-earnings are a
-  projection (B1), same-account payout question (B2).
-- **PR #1** (`admin-2fa-login`) holds the 2FA login work — merge it into `main`.
+  event/merch pricing (R3), ~~PayPal JS SDK for real capture (R4)~~ **DONE — real
+  approve→capture checkout is wired (see §15)**, listen-earnings are a projection (B1),
+  same-account payout question (B2).
+- ~~PR #1 (`admin-2fa-login`)~~ — **merged into `main`** (commit `dade236`).
 
 ## 12. Backups & GitHub
 
@@ -198,7 +199,66 @@ photo); built the entire zero-dependency Node backend (auth, PayPal payments, wa
 payouts, tickets) + `SECURITY-AUDIT.md`; restyled the file converter into the site theme
 and linked it; pushed the project to GitHub and re-credited all history to P2K; then
 built the **two-account email-2FA admin login** and hardened it (fail-closed, lockout,
-no enumeration) — opened as **PR #1**.
+no enumeration) — merged as PR #1.
+
+**Enterprise-hardening pass (later on 2026-07-06)** — full multi-agent audit, every
+finding verified, then fixed:
+- **Server security**: case-insensitive static-server block-list (Windows/macOS `/SERVER/…`
+  could previously download the SQLite DB + signing secret); malformed-cookie 500 fixed;
+  `Cache-Control: no-store` on all API JSON; webhook body size-capped; lockout state now
+  revealed only after a correct password (no enumeration/lock oracle).
+- **Money integrity**: order capture made idempotent under concurrent requests (no double
+  revenue rows); PayPal capture rejects a missing/wrong `currency_code` (fail closed);
+  listen-tick no longer counts a freshly minted visitor identity (cookie-mint bypass of
+  the per-visitor cap closed).
+- **Ops**: fail-fast config validation at boot; deep `/api/health` (DB probe + uptime);
+  structured request logging (`LOG_REQUESTS`); graceful SIGINT/SIGTERM drain;
+  uncaughtException/unhandledRejection logging; header/request/keep-alive timeouts;
+  SQLite `synchronous=NORMAL` + `busy_timeout` + retention pruning (login codes, ip_day,
+  dormant visitors); SMTP client no longer hangs on clean disconnect and accepts a
+  display-name `SMTP_FROM`; legacy single-passcode code path removed.
+- **Front end**: all dynamic renders now HTML-escape (song titles, comments, news,
+  gallery); dead duplicate `updateAdminUI` removed; admin page prompts login from the
+  server session (legacy localStorage gate removed); placeholder AdSense units hidden;
+  News added to the navbar (+ active-state CSS); favicon + Open Graph/Twitter cards on
+  every page; keyboard access + aria-labels on cards/forms; `prefers-reduced-motion` +
+  `:focus-visible` support; track count corrected to 53; admin copy matches the 2FA flow;
+  contact page license contradiction fixed (all rights reserved, licensing via booking).
+- **Repo**: removed cruft (`index - Copy.html`, `index.original.backup.html`,
+  `p2k website instruct.txt` — the last was publicly web-served).
+
+## 16. Cloudflare Workers backend (`worker/`)
+
+A faithful edge port of `server/` on **D1** (SQLite at the edge) — global, ~free,
+no server to run. Same security model, verified on real workerd + D1. The Node
+backend (`server/`) still works for local dev; the Worker is the primary deploy
+target. Mapping + deploy steps: [`worker/README.md`](worker/README.md) and
+[`DEPLOY.md`](DEPLOY.md) §0. Highlights: scrypt→PBKDF2 (WebCrypto), in-memory
+rate-limit→D1 fixed-window, `node:tls` SMTP→`cloudflare:sockets`, filesystem
+static→Workers Assets (only git-tracked public files are staged via
+`build-assets.mjs`; backend/secrets/history are never uploaded), prune
+`setInterval`→cron `scheduled()`. D1 database `p2k-music` already created.
+
+## 15. End-to-end PayPal checkout (R4 closed)
+
+Real buyer-approval checkout replaces the old honor-system `_xclick` links.
+
+- **Live mode** (both PayPal creds set): pages load the PayPal **JS SDK Buttons**. The
+  buyer approves in PayPal's popup; the server **creates** the order (`POST /api/orders`,
+  server-authoritative song price) and **captures + verifies** it
+  (`POST /api/orders/:id/capture`) before anything unlocks. Songs, paid tickets, and
+  merch all run through one shared `mountCheckout()` helper in `assets/app.js`.
+- **Demo mode** (no live creds): the same helper renders a "Pay with PayPal — demo"
+  button that drives the identical server create→capture path (simulated), so the flow
+  is fully testable locally. The site auto-switches to real Buttons the moment both
+  `PAYPAL_CLIENT_ID` + `PAYPAL_SECRET` are set (server restart).
+- **Free RSVP tickets** ($0) skip PayPal entirely and still get a server-signed ticket.
+- New `GET /api/config` exposes `mode` + the **public** PayPal client id (only when
+  live). CSP extended with `*.paypalobjects.com` for the SDK.
+- **Config**: set `PAYPAL_CLIENT_ID` + `PAYPAL_SECRET` (+ `PAYPAL_ENV=sandbox` to test,
+  `production` to go live) in `server/.env`. Client id is public; the secret is not.
+- **Still open**: event/merch prices are client-supplied (R3) — a server-side product
+  catalog would let capture re-price authoritatively; recommended before high volume.
 
 ## 14. Working on this project with Claude
 

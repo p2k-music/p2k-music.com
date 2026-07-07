@@ -1,0 +1,10 @@
+.git
+.gitignore
+.claude
+.project-memory
+server/.env
+server/data
+Dockerfile
+.dockerignore
+render.yaml
+*.zip

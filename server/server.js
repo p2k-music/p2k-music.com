@@ -102,8 +102,9 @@ function requireAdmin(req, res, needCsrf) {
 function getVisitorId(req, res) {
   const cookies = H.parseCookies(req);
   let v = auth.readVisitor(cookies['p2k_v']);
-  if (!v) { const t = auth.issueVisitor(); setCookie(res, 'p2k_v', t, config.visitorTtlMs); v = auth.readVisitor(t); }
-  return v.v;
+  let fresh = false;
+  if (!v) { const t = auth.issueVisitor(); setCookie(res, 'p2k_v', t, config.visitorTtlMs); v = auth.readVisitor(t); fresh = true; }
+  return { id: v.v, fresh };
 }
 
 // ---- validation helpers -------------------------------------------------
@@ -121,9 +122,26 @@ async function handleApi(req, res, url) {
   // global per-IP API ceiling
   if (!auth.rateLimit('api', ip)) return H.sendJson(res, 429, { error: 'rate_limited' });
 
-  // ---- health ----
+  // ---- health (deep: proves the DB answers, not just that the port is open) ----
   if (p === '/api/health' && m === 'GET') {
-    return H.sendJson(res, 200, { ok: true, mode: config.mode, currency: config.currency });
+    let dbOk = true;
+    try { store.prepare('SELECT 1 AS one').get(); } catch (_) { dbOk = false; }
+    return H.sendJson(res, dbOk ? 200 : 503, {
+      ok: dbOk, mode: config.mode, currency: config.currency,
+      emailConfigured: config.emailLive, uptimeSec: Math.floor(process.uptime()),
+    });
+  }
+
+  // ---- public front-end config ----
+  // The PayPal client id is PUBLIC (it ships inside the browser checkout SDK), so
+  // it's safe to expose — but only when live, so demo pages don't try to load it.
+  if (p === '/api/config' && m === 'GET') {
+    return H.sendJson(res, 200, {
+      mode: config.mode,
+      currency: config.currency,
+      songPrice: config.songPrice,
+      paypalClientId: config.paypal.live ? config.paypal.clientId : null,
+    });
   }
 
   // ---- admin auth ----
@@ -137,10 +155,6 @@ async function handleApi(req, res, url) {
     const admin = emailAddr ? q.getAdmin.get(emailAddr) : null;
     const now = Date.now();
 
-    // Account lockout after repeated wrong passwords
-    if (admin && admin.locked_until && now < admin.locked_until) {
-      return H.sendJson(res, 429, { ok: false, error: 'locked', retryInMin: Math.ceil((admin.locked_until - now) / 60000) });
-    }
     // Always run one scrypt verify (real or dummy) so timing can't reveal which emails exist.
     const ok = auth.verifyPasscode(password, admin ? admin.pass_hash : DUMMY_HASH);
     if (!admin || !ok) {
@@ -150,6 +164,12 @@ async function handleApi(req, res, url) {
         else q.setAdminLock.run(fc, 0, emailAddr);
       }
       return H.sendJson(res, 401, { ok: false, error: 'invalid_credentials' });
+    }
+    // Lockout is only revealed AFTER a correct password: a stranger probing
+    // emails gets the same generic 401 whether the account exists, is locked,
+    // or the password is merely wrong — no enumeration, no lock-state oracle.
+    if (admin.locked_until && now < admin.locked_until) {
+      return H.sendJson(res, 429, { ok: false, error: 'locked', retryInMin: Math.ceil((admin.locked_until - now) / 60000) });
     }
     if (admin.fail_count || admin.locked_until) q.setAdminLock.run(0, 0, emailAddr); // reset on success
 
@@ -262,7 +282,13 @@ async function handleApi(req, res, url) {
   // ---- public listen wallet tick (anti-fraud) ----
   if (p === '/api/listen-tick' && m === 'POST') {
     if (!auth.rateLimit('tick', ip)) return H.sendJson(res, 429, { error: 'rate_limited' });
-    const vid = getVisitorId(req, res);
+    const visitor = getVisitorId(req, res);
+    // A brand-new visitor identity never earns on its first tick — otherwise
+    // dropping the cookie each request would mint a fresh identity and turn
+    // the per-visitor daily cap into a no-op. Real listeners keep the cookie
+    // and start counting from their second minute.
+    if (visitor.fresh) return H.sendJson(res, 200, { ok: true, counted: false, reason: 'new_visitor' });
+    const vid = visitor.id;
     const now = Date.now(), day = today();
     const result = store.tx(() => {
       let row = q.getVisitor.get(vid);
@@ -323,17 +349,29 @@ async function handleApi(req, res, url) {
     if (!auth.rateLimit('orders', ip)) return H.sendJson(res, 429, { error: 'rate_limited' });
     const order = q.getOrder.get(capM[1]);
     if (!order) return H.sendJson(res, 404, { error: 'no_order' });
-    if (order.status === 'paid') return H.sendJson(res, 200, grantFor(order, ip)); // idempotent
+    // idempotent: retried captures return the same paid grant shape as the first
+    if (order.status === 'paid') return H.sendJson(res, 200, Object.assign({ paid: true, mode: config.mode }, grantFor(order, ip)));
 
     let cap;
-    try { cap = await paypal.captureOrder(order.paypal_order_id, order.amount_cents, order.currency); }
-    catch (e) { return H.sendJson(res, 502, { paid: false, error: 'paypal_unavailable' }); }
+    if (order.kind === 'ticket' && order.amount_cents === 0) {
+      // Free RSVP — no PayPal charge to capture; the server still issues a signed,
+      // door-validatable ticket. (Event pricing is client-supplied — see R3.)
+      cap = { ok: true, demo: config.mode === 'demo' };
+    } else {
+      try { cap = await paypal.captureOrder(order.paypal_order_id, order.amount_cents, order.currency); }
+      catch (e) { return H.sendJson(res, 502, { paid: false, error: 'paypal_unavailable' }); }
+    }
     if (!cap.ok) return H.sendJson(res, 402, { paid: false, error: cap.error || 'not_paid' });
 
+    // Re-check status INSIDE the transaction: two captures racing past the
+    // early idempotency check above must not both insert a revenue row.
     const grant = store.tx(() => {
-      q.payOrder.run(Date.now(), order.id);
-      q.insRevenue.run(uid(), order.kind, order.title || order.kind, order.amount_cents, order.currency, order.id, Date.now());
-      return grantFor(order, ip);
+      const fresh = q.getOrder.get(order.id) || order;
+      if (fresh.status !== 'paid') {
+        q.payOrder.run(Date.now(), fresh.id);
+        q.insRevenue.run(uid(), fresh.kind, fresh.title || fresh.kind, fresh.amount_cents, fresh.currency, fresh.id, Date.now());
+      }
+      return grantFor(fresh, ip);
     });
     return H.sendJson(res, 200, Object.assign({ paid: true, demo: !!cap.demo, mode: config.mode }, grant));
   }
@@ -390,8 +428,8 @@ async function handleApi(req, res, url) {
 
   // ---- PayPal webhook (reconciliation; verified in live mode) ----
   if (p === '/api/paypal/webhook' && m === 'POST') {
-    const chunks = []; for await (const c of req) chunks.push(c);
-    const raw = Buffer.concat(chunks).toString('utf8');
+    const raw = await H.readRawBody(req, config.bodyLimitBytes); // same DoS cap as every other route
+    if (raw == null) return H.sendJson(res, 413, { error: 'payload_too_large' });
     let vr; try { vr = await paypal.verifyWebhook(req.headers, raw); } catch (_) { vr = { verified: false }; }
     // In demo/unconfigured mode we acknowledge without trusting the event.
     return H.sendJson(res, 200, { received: true, verified: !!vr.verified });
@@ -479,22 +517,56 @@ function ticketPage(res, code) {
 // ============================================================
 //  request dispatch
 // ============================================================
+const ts = () => new Date().toISOString();
+
 const server = http.createServer(async (req, res) => {
+  const t0 = Date.now();
   try {
     const url = new URL(req.url, 'http://localhost');
+    if (config.logRequests) {
+      res.on('finish', () => {
+        // API traffic + anything that went wrong; successful static serves stay quiet.
+        if (url.pathname.startsWith('/api/') || res.statusCode >= 400) {
+          console.log(`[${ts()}] ${req.method} ${url.pathname} ${res.statusCode} ${Date.now() - t0}ms ${H.clientIp(req)}`);
+        }
+      });
+    }
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
     const tm = url.pathname.match(/^\/t\/([\w-]+)\/?$/);
     if (tm && req.method === 'GET') return ticketPage(res, tm[1]);
     if (req.method === 'GET' || req.method === 'HEAD') return H.serveStatic(req, res);
     return H.sendText(res, 405, 'Method not allowed');
   } catch (e) {
-    console.error('unhandled:', e);
+    console.error(`[${ts()}] unhandled ${req.method} ${req.url}:`, e);
     if (!res.headersSent) H.sendJson(res, 500, { error: 'server_error' });
+    else try { res.end(); } catch (_) {}
   }
 });
+
+// Slow-client hardening: bound how long a request may take to arrive.
+// (Response streaming — audio Range requests — is unaffected.)
+server.headersTimeout = 30_000;
+server.requestTimeout = 60_000;
+server.keepAliveTimeout = 5_000;
 
 server.listen(config.port, config.host, () => {
   console.log(`\n  p2k-music.ca backend  ·  mode: ${config.mode.toUpperCase()}`);
   console.log(`  http://localhost:${config.port}  (serving ${config.rootDir})`);
   if (config.mode === 'demo') console.log('  PayPal DEMO mode — payments/payouts are simulated. Set PAYPAL_CLIENT_ID/SECRET for live.\n');
 });
+
+// ---- lifecycle: drain on shutdown, never die silently --------------------
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[${ts()}] ${signal} — draining connections…`);
+  server.close(() => { console.log(`[${ts()}] shutdown complete`); process.exit(0); });
+  setTimeout(() => { console.warn(`[${ts()}] forced exit after drain timeout`); process.exit(1); }, 8000).unref();
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+// Log-and-continue: for a single-process site with no supervisor, staying up
+// beats dying silently. Anything landing here is a bug — the log is the alarm.
+process.on('uncaughtException', (e) => console.error(`[${ts()}] uncaughtException:`, e));
+process.on('unhandledRejection', (e) => console.error(`[${ts()}] unhandledRejection:`, e));

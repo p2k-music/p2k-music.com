@@ -18,6 +18,13 @@ function maskEmail(e) {
   return shown + '***@' + dom;
 }
 
+// "Name <addr@host>" → addr@host for the SMTP envelope (display names are
+// valid in headers, but MAIL FROM/RCPT TO take the bare address only).
+function bareAddress(s) {
+  const m = /<([^<>]+)>/.exec(String(s || ''));
+  return (m ? m[1] : String(s || '')).trim();
+}
+
 // Minimal SMTP/TLS conversation. Resolves on 250 after the message body.
 function smtpSend({ host, port, user, pass, from, to, subject, text }) {
   return new Promise((resolve, reject) => {
@@ -26,9 +33,14 @@ function smtpSend({ host, port, user, pass, from, to, subject, text }) {
     socket.setTimeout(15000);
     let buf = '';
     let waiter = null;
+    let settled = false;
     const cleanup = () => { try { socket.end(); } catch (_) {} };
-    socket.on('timeout', () => { cleanup(); reject(new Error('smtp_timeout')); });
-    socket.on('error', (e) => { cleanup(); reject(e); });
+    const fail = (e) => { if (settled) return; settled = true; cleanup(); reject(e); };
+    socket.on('timeout', () => fail(new Error('smtp_timeout')));
+    socket.on('error', fail);
+    // A clean server-side disconnect mid-conversation must not leave the
+    // login request hanging on a waiter that will never be called.
+    socket.on('close', () => fail(new Error('smtp_connection_closed')));
     socket.on('data', (chunk) => {
       buf += chunk;
       const lines = buf.split('\r\n');
@@ -49,8 +61,8 @@ function smtpSend({ host, port, user, pass, from, to, subject, text }) {
       socket.write('AUTH LOGIN\r\n'); c = await read(); if (c !== 334) throw new Error('auth ' + c);
       socket.write(b64(user) + '\r\n'); c = await read(); if (c !== 334) throw new Error('user ' + c);
       socket.write(b64(pass) + '\r\n'); c = await read(); if (c !== 235) throw new Error('pass ' + c);
-      socket.write(`MAIL FROM:<${from}>\r\n`); c = await read(); if (c !== 250) throw new Error('from ' + c);
-      socket.write(`RCPT TO:<${to}>\r\n`); c = await read(); if (c !== 250 && c !== 251) throw new Error('rcpt ' + c);
+      socket.write(`MAIL FROM:<${bareAddress(from)}>\r\n`); c = await read(); if (c !== 250) throw new Error('from ' + c);
+      socket.write(`RCPT TO:<${bareAddress(to)}>\r\n`); c = await read(); if (c !== 250 && c !== 251) throw new Error('rcpt ' + c);
       socket.write('DATA\r\n'); c = await read(); if (c !== 354) throw new Error('data ' + c);
       const msg =
         `From: ${from}\r\nTo: ${to}\r\nSubject: ${subject}\r\n` +
@@ -58,8 +70,9 @@ function smtpSend({ host, port, user, pass, from, to, subject, text }) {
         `${text}\r\n.\r\n`;
       socket.write(msg); c = await read(); if (c !== 250) throw new Error('body ' + c);
       socket.write('QUIT\r\n');
+      settled = true;
       cleanup();
-    })().then(resolve).catch((e) => { cleanup(); reject(e); });
+    })().then(resolve).catch(fail);
   });
 }
 
