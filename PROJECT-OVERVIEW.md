@@ -179,8 +179,9 @@ payouts, CSP + security headers, Range-streaming static server with traversal gu
 - **Rights/licensing:** some catalog tracks look like other artists'/remixes — selling
   them + running ads needs P2K to own/license them (legal, not code).
 - Residual security items (see audit): gate raw `audio/` download URLs (R2), server-side
-  event/merch pricing (R3), PayPal JS SDK for real capture (R4), listen-earnings are a
-  projection (B1), same-account payout question (B2).
+  event/merch pricing (R3), ~~PayPal JS SDK for real capture (R4)~~ **DONE — real
+  approve→capture checkout is wired (see §15)**, listen-earnings are a projection (B1),
+  same-account payout question (B2).
 - ~~PR #1 (`admin-2fa-login`)~~ — **merged into `main`** (commit `dade236`).
 
 ## 12. Backups & GitHub
@@ -225,6 +226,27 @@ finding verified, then fixed:
   contact page license contradiction fixed (all rights reserved, licensing via booking).
 - **Repo**: removed cruft (`index - Copy.html`, `index.original.backup.html`,
   `p2k website instruct.txt` — the last was publicly web-served).
+
+## 15. End-to-end PayPal checkout (R4 closed)
+
+Real buyer-approval checkout replaces the old honor-system `_xclick` links.
+
+- **Live mode** (both PayPal creds set): pages load the PayPal **JS SDK Buttons**. The
+  buyer approves in PayPal's popup; the server **creates** the order (`POST /api/orders`,
+  server-authoritative song price) and **captures + verifies** it
+  (`POST /api/orders/:id/capture`) before anything unlocks. Songs, paid tickets, and
+  merch all run through one shared `mountCheckout()` helper in `assets/app.js`.
+- **Demo mode** (no live creds): the same helper renders a "Pay with PayPal — demo"
+  button that drives the identical server create→capture path (simulated), so the flow
+  is fully testable locally. The site auto-switches to real Buttons the moment both
+  `PAYPAL_CLIENT_ID` + `PAYPAL_SECRET` are set (server restart).
+- **Free RSVP tickets** ($0) skip PayPal entirely and still get a server-signed ticket.
+- New `GET /api/config` exposes `mode` + the **public** PayPal client id (only when
+  live). CSP extended with `*.paypalobjects.com` for the SDK.
+- **Config**: set `PAYPAL_CLIENT_ID` + `PAYPAL_SECRET` (+ `PAYPAL_ENV=sandbox` to test,
+  `production` to go live) in `server/.env`. Client id is public; the secret is not.
+- **Still open**: event/merch prices are client-supplied (R3) — a server-side product
+  catalog would let capture re-price authoritatively; recommended before high volume.
 
 ## 14. Working on this project with Claude
 

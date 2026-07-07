@@ -132,6 +132,18 @@ async function handleApi(req, res, url) {
     });
   }
 
+  // ---- public front-end config ----
+  // The PayPal client id is PUBLIC (it ships inside the browser checkout SDK), so
+  // it's safe to expose — but only when live, so demo pages don't try to load it.
+  if (p === '/api/config' && m === 'GET') {
+    return H.sendJson(res, 200, {
+      mode: config.mode,
+      currency: config.currency,
+      songPrice: config.songPrice,
+      paypalClientId: config.paypal.live ? config.paypal.clientId : null,
+    });
+  }
+
   // ---- admin auth ----
   // ---- admin auth step 1: email + password → email a one-time code ----
   if (p === '/api/admin/login' && m === 'POST') {
@@ -341,8 +353,14 @@ async function handleApi(req, res, url) {
     if (order.status === 'paid') return H.sendJson(res, 200, Object.assign({ paid: true, mode: config.mode }, grantFor(order, ip)));
 
     let cap;
-    try { cap = await paypal.captureOrder(order.paypal_order_id, order.amount_cents, order.currency); }
-    catch (e) { return H.sendJson(res, 502, { paid: false, error: 'paypal_unavailable' }); }
+    if (order.kind === 'ticket' && order.amount_cents === 0) {
+      // Free RSVP — no PayPal charge to capture; the server still issues a signed,
+      // door-validatable ticket. (Event pricing is client-supplied — see R3.)
+      cap = { ok: true, demo: config.mode === 'demo' };
+    } else {
+      try { cap = await paypal.captureOrder(order.paypal_order_id, order.amount_cents, order.currency); }
+      catch (e) { return H.sendJson(res, 502, { paid: false, error: 'paypal_unavailable' }); }
+    }
     if (!cap.ok) return H.sendJson(res, 402, { paid: false, error: cap.error || 'not_paid' });
 
     // Re-check status INSIDE the transaction: two captures racing past the

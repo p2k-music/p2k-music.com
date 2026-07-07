@@ -40,7 +40,9 @@ const config = {
   port: num(env.PORT, 8123),
   host: env.HOST || '0.0.0.0',
   rootDir: path.resolve(__dirname, '..'),        // static site root (repo root)
-  dataDir: path.join(__dirname, 'data'),         // sqlite + runtime state
+  // sqlite + runtime state. Override with DATA_DIR on hosts where the persistent
+  // disk mounts elsewhere (e.g. /data on Render/Fly) — else the DB dies on redeploy.
+  dataDir: env.DATA_DIR ? path.resolve(env.DATA_DIR) : path.join(__dirname, 'data'),
   behindTLS: bool(env.BEHIND_TLS, false),        // set true when served over HTTPS (enables Secure cookies + HSTS)
   trustProxy: bool(env.TRUST_PROXY, false),      // honour X-Forwarded-For (only behind a trusted proxy)
 

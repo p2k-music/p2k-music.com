@@ -25,13 +25,13 @@ function cspValue() {
     "default-src 'self'",
     "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net " +
       "https://pagead2.googlesyndication.com https://*.googlesyndication.com https://*.doubleclick.net " +
-      "https://www.paypal.com https://*.paypal.com https://www.googletagservices.com https://*.google.com",
+      "https://www.paypal.com https://*.paypal.com https://*.paypalobjects.com https://www.googletagservices.com https://*.google.com",
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com",
     "font-src 'self' data: https://fonts.gstatic.com https://cdnjs.cloudflare.com",
     "img-src 'self' data: blob: https:",
     "media-src 'self' blob:",
     "connect-src 'self' https://*.paypal.com https://api-m.paypal.com https://api-m.sandbox.paypal.com " +
-      "https://api.qrserver.com https://*.googlesyndication.com https://*.doubleclick.net",
+      "https://*.paypalobjects.com https://api.qrserver.com https://*.googlesyndication.com https://*.doubleclick.net",
     "frame-src https://www.paypal.com https://*.paypal.com https://*.googlesyndication.com " +
       "https://*.doubleclick.net https://googleads.g.doubleclick.net",
     "object-src 'none'", "base-uri 'self'",

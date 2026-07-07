@@ -4,7 +4,6 @@
         const DB_VERSION = 6;
         const SONG_PRICE = 16;
         const PREVIEW_SECONDS = 30;
-        const PAYPAL_EMAIL = 'p2key1@gmail.com';
 
         // ── Backend API helper (same-origin; the session travels in an HttpOnly cookie) ──
         const API_BASE = '';
@@ -16,6 +15,113 @@
             const res = await fetch(API_BASE + path, opts);
             let data = null; try { data = await res.json(); } catch (e) {}
             return { ok: res.ok, status: res.status, data };
+        }
+
+        // ══ PAYPAL CHECKOUT ═════════════════════════════════════════════════
+        // Live mode: real PayPal JS SDK Buttons — buyer approves in a popup, then
+        // the server captures & verifies the payment before anything unlocks.
+        // Demo mode (no live credentials): a simulate button drives the same
+        // server create→capture path so the flow is fully testable locally.
+        let siteMode = 'demo';
+        const PAYPAL_SDK = { clientId: null, currency: 'CAD', loaded: false, loading: null };
+
+        async function loadSiteConfig() {
+            try {
+                const r = await api('GET', '/api/config');
+                if (r.ok && r.data) {
+                    siteMode = r.data.mode || 'demo';
+                    PAYPAL_SDK.currency = r.data.currency || 'CAD';
+                    if (r.data.paypalClientId) PAYPAL_SDK.clientId = r.data.paypalClientId;
+                }
+            } catch (e) { /* backend unreachable — stay in demo */ }
+        }
+
+        function loadPayPalSDK() {
+            if (PAYPAL_SDK.loaded) return Promise.resolve(true);
+            if (PAYPAL_SDK.loading) return PAYPAL_SDK.loading;
+            if (!PAYPAL_SDK.clientId) return Promise.resolve(false);
+            PAYPAL_SDK.loading = new Promise((resolve) => {
+                const s = document.createElement('script');
+                s.src = 'https://www.paypal.com/sdk/js?client-id=' + encodeURIComponent(PAYPAL_SDK.clientId) +
+                        '&currency=' + encodeURIComponent(PAYPAL_SDK.currency) + '&intent=capture';
+                s.onload = () => { PAYPAL_SDK.loaded = true; resolve(true); };
+                s.onerror = () => resolve(false);
+                document.head.appendChild(s);
+            });
+            return PAYPAL_SDK.loading;
+        }
+
+        // Mount a checkout into `container`. `getPayload` is an object (or a function
+        // returning one — or null to abort with its own message) POSTed to /api/orders.
+        // `onPaid(captureData)` fires only after the server confirms payment.
+        async function mountCheckout(container, getPayload, onPaid) {
+            if (!container) return;
+            const resolvePayload = () => {
+                try { return (typeof getPayload === 'function') ? getPayload() : getPayload; }
+                catch (e) { return null; }
+            };
+
+            if (siteMode === 'live' && PAYPAL_SDK.clientId) {
+                container.innerHTML = '<div class="checkout-loading"><i class="fas fa-spinner fa-spin"></i> Loading secure checkout…</div>';
+                const ready = await loadPayPalSDK();
+                if (ready && window.paypal && window.paypal.Buttons) {
+                    container.innerHTML = '';
+                    let ourOrderId = null;
+                    try {
+                        window.paypal.Buttons({
+                            style: { layout: 'vertical', color: 'gold', shape: 'pill', label: 'paypal' },
+                            createOrder: async () => {
+                                const payload = resolvePayload();
+                                if (!payload) throw new Error('cancelled');
+                                const r = await api('POST', '/api/orders', payload);
+                                if (!(r.ok && r.data && r.data.paypalOrderId)) throw new Error('order_failed');
+                                ourOrderId = r.data.orderId;
+                                return r.data.paypalOrderId;
+                            },
+                            onApprove: async () => {
+                                const cap = await api('POST', '/api/orders/' + ourOrderId + '/capture', {});
+                                if (cap.ok && cap.data && cap.data.paid) onPaid(cap.data);
+                                else showNotification('Payment could not be verified — please try again');
+                            },
+                            onCancel: () => showNotification('Checkout cancelled'),
+                            onError: () => showNotification('PayPal had a problem — please try again'),
+                        }).render(container).catch(() => {
+                            container.innerHTML = '<p class="tm-hint">Checkout failed to load — refresh and try again.</p>';
+                        });
+                        return;
+                    } catch (e) { /* fall through to the manual button */ }
+                }
+                // SDK blocked/unavailable — fall through to the manual path so buyers aren't stuck.
+            }
+
+            // DEMO / fallback path — server is in demo mode, payment is simulated (no real charge).
+            container.innerHTML = '';
+            const btn = document.createElement('button');
+            btn.className = 'cta-button';
+            btn.style.width = '100%'; btn.style.justifyContent = 'center';
+            const label = '<i class="fab fa-paypal"></i> Pay with PayPal';
+            btn.innerHTML = label;
+            btn.addEventListener('click', async () => {
+                const payload = resolvePayload();
+                if (!payload) return;
+                btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing…';
+                try {
+                    const r = await api('POST', '/api/orders', payload);
+                    if (r.ok && r.data && r.data.orderId) {
+                        const cap = await api('POST', '/api/orders/' + r.data.orderId + '/capture', {});
+                        if (cap.ok && cap.data && cap.data.paid) { onPaid(cap.data); return; }
+                    }
+                    showNotification('Payment did not complete — please try again');
+                } catch (e) { showNotification('Could not reach the server'); }
+                finally { btn.disabled = false; btn.innerHTML = label; }
+            });
+            container.appendChild(btn);
+            if (siteMode !== 'live') {
+                const note = document.createElement('p');
+                note.className = 'tm-hint';
+                note.innerHTML = '<i class="fas fa-flask"></i> Demo mode — no real charge.';
+                container.appendChild(note);
+            }
         }
 
         const DEFAULT_SONGS = [
@@ -901,23 +1007,17 @@
             }
         }
 
-        // PAYPAL PAYMENT
+        // PAYPAL PAYMENT — real approve→capture via mountCheckout (see the checkout helper up top)
         function openPaypalModal(songId) {
             const song = songs.find(s => s.id === songId);
             if (!song) return;
             currentBuySongId = songId;
             document.getElementById('paypalSongTitle').textContent = song.title;
             document.getElementById('paypalModal').classList.add('show');
-
-            // Render PayPal button
             const container = document.getElementById('paypal-button-container');
-            container.innerHTML = `
-                <a href="https://www.paypal.com/cgi-bin/webscr?cmd=_xclick&business=${encodeURIComponent(PAYPAL_EMAIL)}&item_name=${encodeURIComponent(song.title + ' - p2k-music.ca')}&amount=${SONG_PRICE}&currency_code=CAD&return=${encodeURIComponent(window.location.href)}&cancel_return=${encodeURIComponent(window.location.href)}" target="_blank" class="buy-btn" style="display:inline-flex; padding:0.8rem 2rem; font-size:1rem; text-decoration:none; justify-content:center;" onclick="handlePaypalClick(${songId})">
-                    <i class="fab fa-paypal"></i> Pay $${SONG_PRICE} CAD with PayPal
-                </a>
-                <p style="margin-top:1rem; color:rgba(255,255,255,0.5); font-size:0.85rem;">After payment, click the button below to unlock your track.</p>
-                <button class="btn" onclick="confirmPurchase(${songId})" style="margin-top:0.5rem;"><i class="fas fa-check-circle"></i> I've Completed Payment</button>
-            `;
+            mountCheckout(container,
+                { kind: 'song', ref: String(songId), title: song.title },
+                () => onSongPurchased(songId));
         }
 
         function closePaypalModal() {
@@ -925,30 +1025,15 @@
             currentBuySongId = null;
         }
 
-        function handlePaypalClick(songId) {
-            showNotification('Complete your PayPal payment, then click "I\'ve Completed Payment"');
-        }
-
-        async function confirmPurchase(songId) {
+        // Fires only after the server has captured & verified the payment.
+        async function onSongPurchased(songId) {
             const song = songs.find(s => s.id === songId);
-            // Verify + record the sale server-side. DEMO mode simulates the capture;
-            // LIVE mode confirms the payment with PayPal before unlocking.
-            try {
-                const ord = await api('POST', '/api/orders', { kind: 'song', ref: String(songId), title: song ? song.title : 'Track' });
-                if (ord.ok && ord.data && ord.data.orderId) {
-                    const cap = await api('POST', '/api/orders/' + ord.data.orderId + '/capture', {});
-                    if (!(cap.ok && cap.data && cap.data.paid)) {
-                        showNotification('Payment not verified yet — finish PayPal checkout, then click again');
-                        return;
-                    }
-                }
-            } catch (e) { /* backend offline — fall back to local unlock */ }
             purchasedSongs.add(songId);
             await dbPut('purchases', { songId: songId, date: new Date().toISOString() });
             closePaypalModal();
             renderSongs();
             logRevenue('music', song ? song.title : 'Track', SONG_PRICE);
-            showNotification('Purchased "' + (song ? song.title : 'track') + '" - you can now play & download the full track!');
+            showNotification('Purchased "' + (song ? song.title : 'track') + '" — you can now play & download the full track!');
         }
 
         // Prevent right-click saving on audio elements
@@ -1213,17 +1298,17 @@
             document.getElementById('tmEmail').value = '';
 
             const pay = document.getElementById('tmPayContainer');
+            pay.innerHTML = '';
             if (price > 0) {
-                const link = 'https://www.paypal.com/cgi-bin/webscr?cmd=_xclick&business=' + encodeURIComponent(PAYPAL_EMAIL) +
-                    '&item_name=' + encodeURIComponent('Ticket: ' + ev.title + ' - p2k-music.ca') +
-                    '&amount=' + price.toFixed(2) + '&currency_code=CAD&return=' + encodeURIComponent(window.location.href) +
-                    '&cancel_return=' + encodeURIComponent(window.location.href);
-                pay.innerHTML =
-                    '<a class="tm-pay-btn" target="_blank" rel="noopener" href="' + link + '"><i class="fab fa-paypal"></i> Pay $' + price.toFixed(2) + ' CAD</a>' +
-                    '<p class="tm-hint">After paying, tap below to generate your ticket.</p>' +
-                    '<button class="cta-button" style="width:100%;justify-content:center;" onclick="confirmTicketPurchase()"><i class="fas fa-ticket"></i> I\'ve Paid — Generate Ticket</button>';
+                // Real PayPal checkout — the ticket is only issued after the server captures.
+                mountCheckout(pay, () => ticketPayload(ev),
+                    (data) => finalizeTicket(ev, data.ticket, (data.ticket && data.ticket.holder) || '', (data.ticket && data.ticket.email) || ''));
             } else {
-                pay.innerHTML = '<button class="cta-button" style="width:100%;justify-content:center;" onclick="confirmTicketPurchase()"><i class="fas fa-ticket"></i> Reserve Free Ticket</button>';
+                const b = document.createElement('button');
+                b.className = 'cta-button'; b.style.width = '100%'; b.style.justifyContent = 'center';
+                b.innerHTML = '<i class="fas fa-ticket"></i> Reserve Free Ticket';
+                b.addEventListener('click', () => reserveFreeTicket(ev));
+                pay.appendChild(b);
             }
             document.getElementById('ticketModal').classList.add('show');
         }
@@ -1287,54 +1372,58 @@
             return node;
         }
 
-        // Generate the ticket on the spot after purchase
-        async function confirmTicketPurchase() {
-            const ev = events.find(e => String(e.id) === String(currentTicketEventId));
-            if (!ev) { closeTicketModal(); return; }
+        // Build the /api/orders payload for a ticket, validating the holder name.
+        // Returns null (with a message) to abort checkout before any PayPal order opens.
+        function ticketPayload(ev) {
+            const holder = document.getElementById('tmName').value.trim();
+            if (!holder) { showNotification('Please enter the name for the ticket'); document.getElementById('tmName').focus(); return null; }
+            const cap = Number(ev.capacity) || 0, sold = Number(ev.sold) || 0;
+            if (cap > 0 && sold >= cap) { showNotification('Sorry, this show just sold out'); return null; }
+            return {
+                kind: 'ticket', ref: String(ev.id), title: ev.title, price: Number(ev.price) || 0,
+                holder: holder, email: document.getElementById('tmEmail').value.trim(),
+                eventDate: ev.date, venue: ev.venue || '', city: ev.city || ''
+            };
+        }
+
+        // Free RSVP — no PayPal; the server still issues a signed ticket (or we fall
+        // back to a local one if the backend is offline).
+        async function reserveFreeTicket(ev) {
             const holder = document.getElementById('tmName').value.trim();
             if (!holder) { showNotification('Please enter the name for the ticket'); document.getElementById('tmName').focus(); return; }
             const email = document.getElementById('tmEmail').value.trim();
-            const cap = Number(ev.capacity) || 0, sold = Number(ev.sold) || 0;
-            if (cap > 0 && sold >= cap) { showNotification('Sorry, this show just sold out'); return; }
-
-            // Issue the ticket SERVER-SIDE so it is signed and validatable at the door
-            // from any device. Falls back to local generation if the backend is offline.
-            let ticket = null;
             try {
                 const ord = await api('POST', '/api/orders', {
-                    kind: 'ticket', ref: String(ev.id), title: ev.title, price: Number(ev.price) || 0,
+                    kind: 'ticket', ref: String(ev.id), title: ev.title, price: 0,
                     holder: holder, email: email, eventDate: ev.date, venue: ev.venue || '', city: ev.city || ''
                 });
                 if (ord.ok && ord.data && ord.data.orderId) {
                     const cap = await api('POST', '/api/orders/' + ord.data.orderId + '/capture', {});
-                    if (cap.ok && cap.data && cap.data.paid && cap.data.ticket) {
-                        const st = cap.data.ticket;
-                        ticket = {
-                            id: st.code, eventId: ev.id, eventTitle: st.eventTitle || ev.title, eventDate: st.eventDate || ev.date,
-                            venue: st.venue || ev.venue || '', city: st.city || ev.city || '', holder: st.holder || holder,
-                            email: st.email || email, price: Number(st.price) || 0, purchasedAt: new Date().toISOString(),
-                            status: st.status || 'valid', serverIssued: true
-                        };
-                    } else if (cap.data && cap.data.paid === false) {
-                        showNotification('Payment not verified yet — finish PayPal checkout, then try again');
-                        return;
-                    }
+                    if (cap.ok && cap.data && cap.data.paid) { finalizeTicket(ev, cap.data.ticket, holder, email); return; }
                 }
-            } catch (e) { /* backend offline — generate locally below */ }
-            if (!ticket) {
-                ticket = {
-                    id: genTicketCode(ev), eventId: ev.id, eventTitle: ev.title, eventDate: ev.date,
-                    venue: ev.venue || '', city: ev.city || '', holder: holder, email: email,
-                    price: Number(ev.price) || 0, purchasedAt: new Date().toISOString(), status: 'valid'
-                };
-            }
+            } catch (e) { /* backend offline — issue locally below */ }
+            finalizeTicket(ev, null, holder, email);
+        }
 
-            ev.sold = sold + 1;
+        // Save + render a freshly issued ticket. `st` is the server-signed ticket
+        // (preferred, validatable at the door) or null for the offline fallback.
+        async function finalizeTicket(ev, st, holder, email) {
+            const ticket = st ? {
+                id: st.code, eventId: ev.id, eventTitle: st.eventTitle || ev.title, eventDate: st.eventDate || ev.date,
+                venue: st.venue || ev.venue || '', city: st.city || ev.city || '', holder: st.holder || holder,
+                email: st.email || email, price: Number(st.price) || 0, purchasedAt: new Date().toISOString(),
+                status: st.status || 'valid', serverIssued: true
+            } : {
+                id: genTicketCode(ev), eventId: ev.id, eventTitle: ev.title, eventDate: ev.date,
+                venue: ev.venue || '', city: ev.city || '', holder: holder, email: email,
+                price: Number(ev.price) || 0, purchasedAt: new Date().toISOString(), status: 'valid'
+            };
+
+            ev.sold = (Number(ev.sold) || 0) + 1;
             await dbPut('tickets', ticket);
             await dbPut('events', ev); // persist sold count (and default events on first sale)
             myTickets.push(ticket);
 
-            // Show the freshly generated ticket
             const view = document.getElementById('ticketResultView');
             document.getElementById('ticketBuyView').style.display = 'none';
             view.style.display = 'block';
@@ -1349,7 +1438,7 @@
             if (ticket.price > 0) logRevenue('ticket', ticket.eventTitle, ticket.price);
             renderTour();
             loadMyTickets();
-            showNotification('🎫 Ticket generated for ' + holder + '!');
+            showNotification('🎫 Ticket generated for ' + (ticket.holder || 'you') + '!');
         }
 
         function loadMyTickets() {
@@ -1556,6 +1645,7 @@
                 sizeSel.innerHTML = '';
             }
             updateMerchTotal();
+            mountCheckout(document.getElementById('mmPayContainer'), () => merchPayload(), () => onMerchPaid());
             document.getElementById('merchModal').classList.add('show');
         }
 
@@ -1564,26 +1654,39 @@
             currentMerch = null;
         }
 
+        // Read the live selection (size + quantity) at click time so one mounted
+        // button always charges the current total.
+        function merchPayload() {
+            const it = MERCH_ITEMS[currentMerch];
+            if (!it) return null;
+            const size = it.sizes ? (document.getElementById('mmSize').value || '') : '';
+            const total = it.price * merchQty;
+            const label = it.name + (size ? ' - Size ' + size : '') + (merchQty > 1 ? ' x' + merchQty : '');
+            return { kind: 'merch', ref: currentMerch, title: label + ' - p2k-music.ca', price: total };
+        }
+
+        function onMerchPaid() {
+            const it = MERCH_ITEMS[currentMerch];
+            const total = it ? it.price * merchQty : 0;
+            const label = it ? it.name + (merchQty > 1 ? ' x' + merchQty : '') : 'Merch';
+            logRevenue('merch', label, total);
+            closeMerchModal();
+            showNotification('Order placed — thank you! Ships in 5–7 days.');
+        }
+
         function mmQty(delta) {
             merchQty = Math.max(1, Math.min(10, merchQty + delta));
             document.getElementById('mmQtyVal').textContent = merchQty;
             updateMerchTotal();
         }
 
+        // Quantity/size only change the displayed total — the mounted checkout
+        // button reads the current selection at click time (see merchPayload).
         function updateMerchTotal() {
             const it = MERCH_ITEMS[currentMerch];
             if (!it) return;
             const total = it.price * merchQty;
             document.getElementById('mmTotal').textContent = '$' + total.toFixed(2) + ' CAD';
-            const size = it.sizes ? (' - Size ' + document.getElementById('mmSize').value) : '';
-            const itemName = it.name + size + (merchQty > 1 ? ' x' + merchQty : '') + ' - p2k-music.ca';
-            const href = 'https://www.paypal.com/cgi-bin/webscr?cmd=_xclick&business=' + encodeURIComponent(PAYPAL_EMAIL) +
-                '&item_name=' + encodeURIComponent(itemName) +
-                '&amount=' + total.toFixed(2) + '&currency_code=CAD&return=' + encodeURIComponent(window.location.href) +
-                '&cancel_return=' + encodeURIComponent(window.location.href);
-            document.getElementById('mmPayContainer').innerHTML =
-                '<a class="tm-pay-btn" target="_blank" rel="noopener" href="' + href + '" onclick="recordMerchIntent()"><i class="fab fa-paypal"></i> Pay $' + total.toFixed(2) + ' CAD</a>' +
-                '<p class="tm-hint">Secure checkout via PayPal · ships in 5–7 days</p>';
         }
 
         // ── PODCAST: episodes, playback, guest applications & invites ──
@@ -1774,11 +1877,6 @@
             renderProfit();
         }
 
-        function recordMerchIntent() {
-            const it = MERCH_ITEMS[currentMerch];
-            if (it) logRevenue('merch', it.name + (merchQty > 1 ? ' x' + merchQty : ''), it.price * merchQty);
-        }
-
         async function recordIncome() {
             if (!isAdmin) { showNotification('Admin access required'); return; }
             const source = val('incSource') || 'other';
@@ -1837,6 +1935,7 @@
         // INITIALIZE
         async function init() {
             const adminReady = checkAdminStatus(); // resolves once the server session is known
+            const configReady = loadSiteConfig();  // mode + public PayPal client id
             try {
                 await openDB();
                 await loadFromDB();
@@ -1844,6 +1943,7 @@
             } catch(e) {
                 console.warn('IndexedDB init failed, using defaults:', e);
             }
+            await configReady; // checkout needs to know live vs demo before any Buy click
             // Check which audio files actually exist on the server (only where the music grid exists)
             if (document.getElementById('songsGrid')) await checkFileAvailability();
             renderSongs();
