@@ -1,0 +1,2338 @@
+# p2k-music.ca — Security Audit
+
+**Date:** 2026-07-06  ·  **Scope:** the new Node backend (`server/`) + the client
+money/admin/ticket flows it replaces.  ·  **Reviewer:** Aaron (with Claude Code).
+
+This audit records the vulnerabilities present in the client-only version of the
+site, how the backend closes them, and the risks that remain to be addressed
+before handling **real** money in production.
+
+---
+
+## 1. Summary
+
+The site was fully client-side: the admin passcode lived in JavaScript, "payments"
+were an honor-system button, tickets were generated (and thus forgeable) in the
+browser, and the wallet/earnings endpoints it called did not exist. The new
+backend introduces a server as the source of truth with defense-in-depth:
+server-verified admin auth, PayPal-verified payments, HMAC-signed tickets,
+an anti-fraud listen wallet, PayPal payouts, and hardened HTTP.
+
+| # | Issue | Severity | Status |
+|---|-------|----------|--------|
+| V1 | Admin passcode hard-coded in client JS (`199430`) | **Critical** | ✅ Fixed |
+| V2 | Honor-system payments — goods unlocked with no verification | **Critical** | ✅ Fixed (live) / ⚠️ demo simulates |
+| V3 | Forgeable client-generated tickets; door scanner blind cross-device | **High** | ✅ Fixed |
+| V4 | Unauthenticated earnings/withdraw (money endpoints) | **High** | ✅ Fixed |
+| V5 | Listen-tick earnings inflatable by bots | **High** | ✅ Mitigated |
+| V6 | No security headers / transport hardening | **Medium** | ✅ Fixed |
+| V7 | Static-file path traversal / source exposure | **Medium** | ✅ Fixed |
+| V8 | No brute-force / rate limiting | **Medium** | ✅ Fixed |
+| V9 | Unbounded request bodies (DoS) | **Low** | ✅ Fixed |
+
+---
+
+## 2. Vulnerabilities fixed
+
+### V1 — Client-side admin passcode  *(Critical)*
+**Before:** `const ADMIN_PASSCODE = '199430'` sat in `assets/app.js`; anyone who
+opened DevTools could read it and unlock every admin panel.
+**Now:** The passcode is verified only by the server (`POST /api/admin/login`),
+stored as a **scrypt** hash (`server/auth.js`), compared in constant time. Success
+issues an **HttpOnly, SameSite=Lax, HMAC-signed** session cookie the browser JS
+cannot read. The client no longer contains the passcode. Seed your private code
+via `P2K_ADMIN_PASSCODE` in `server/.env` (the app warns loudly while it is still
+using the legacy default).
+
+> The client `isAdmin` flag only toggles which panels are *shown*. Every
+> privileged action (earnings, withdraw, check-in, issue-ticket) is enforced
+> server-side by the cookie, so faking `isAdmin` in the console grants nothing.
+
+### V2 — Honor-system payments  *(Critical)*
+**Before:** "I've Completed Payment" marked a track owned with zero verification —
+free music, and self-reported "revenue."
+**Now:** Purchases go through `POST /api/orders` → `POST /api/orders/:id/capture`.
+The **server sets the song price** ($16, not the client), and in **live** mode the
+capture is verified against PayPal (Orders v2) before anything unlocks; a paid
+order is recorded in the server `revenue` ledger. See **R4** — the live capture
+still needs the PayPal JS SDK/webhook wired to be bullet-proof for real money.
+
+### V3 — Forgeable tickets + blind door scanner  *(High)*
+**Before:** Tickets were generated in the browser (`P2K-XXX-######`) and only ever
+lived in *that* browser's IndexedDB, so the door scanner on another phone could not
+validate them, and anyone could fabricate a code.
+**Now:** Tickets are **issued server-side** with an **HMAC signature** over
+`code+event+holder+issued_at` (`issueTicket`). Validation is cross-device:
+`GET /api/ticket/:code` reports validity and detects forgery; `POST /api/ticket/:code/checkin`
+(admin+CSRF) marks a ticket used exactly once; the QR's `https://p2k-music.ca/t/:code`
+now resolves to a real server page showing VALID / ALREADY USED / FORGED. The client
+falls back to local validation only when the backend is unreachable.
+
+### V4 — Unauthenticated money endpoints  *(High)*
+**Now:** `GET /api/earnings` and `POST /api/withdraw` require the admin session;
+`withdraw` additionally requires a **CSRF token** (double-submit header). The
+withdrawable balance is **computed by the server** from the verified ledger
+(`sales + listen − payouts`), never trusted from the client. Withdrawals:
+- reserve the balance **atomically** inside a SQLite `IMMEDIATE` transaction so two
+  concurrent requests cannot double-spend;
+- use an idempotent `sender_batch_id` so a retry cannot double-pay;
+- on a network error mid-payout, the reservation is **kept** (never released) so we
+  fail safe toward *not* paying twice.
+
+### V5 — Listen-tick earnings fraud  *(High)*
+**Before:** `POST /api/listen-tick` fires for *every* visitor on play and is the
+real earnings signal — a bot could POST it endlessly.
+**Now:** Each visitor gets a **signed visitor cookie**; the server enforces a
+**≥55 s minimum cadence**, a **per-visitor daily cap** and a **per-IP daily cap**,
+all behind a per-IP rate limiter. Ticks that violate the rules return
+`counted:false` instead of accruing. *Residual:* this throttles abuse but is not
+cryptographic proof-of-listening — see **B1** for the economic caveat.
+
+### V6 — HTTP hardening  *(Medium)*
+Every response now carries `Content-Security-Policy` (scoped to the exact CDNs the
+site uses), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+`Referrer-Policy`, `Permissions-Policy` (camera=self so the scanner works, else
+denied), `Cross-Origin-Opener-Policy`, and `Strict-Transport-Security` when
+`BEHIND_TLS=true`.
+
+### V7 — Static-file safety  *(Medium)*
+The static server normalizes the path and confirms it stays under the site root
+(no `..` escape), refuses dotfiles (`.env`, `.git`) and the `server/` directory,
+and never lists directories. Range requests are supported so large MP3s stream and
+seek correctly.
+
+### V8 / V9 — Rate limiting & body caps
+Per-IP token buckets protect `login`, `withdraw`, `listen-tick`, `orders`, plus a
+global API ceiling. JSON bodies are capped at 256 KB.
+
+---
+
+## 3. Residual risks — do before real money
+
+| # | Risk | Sev | Recommendation |
+|---|------|-----|----------------|
+| **R4** | Live PayPal capture is not yet bound to a real payment — the `_xclick` redirect + "I've completed payment" is demo-grade. | **High** | Wire the PayPal **JS SDK** (`createOrder`/`onApprove` → `/api/orders/:id/capture`) or rely on the provided **webhook** (`/api/paypal/webhook`, signature-verified) before selling live. |
+| R1 | CSP allows `'unsafe-inline'` for scripts because the pages use inline `onclick=` handlers. | Medium | Move handlers to `addEventListener`, then switch to a **nonce/hash CSP** and drop `unsafe-inline`. |
+| R2 | Audio files are public static — a paid unlock gates the UI/download button, not the raw `audio/…mp3` URL. The 30-s preview is client-enforced only. | Medium | Serve paid tracks through an **authenticated, signed streaming endpoint** per order; generate real 30-s preview clips for the public path. |
+| R3 | Ticket/merch prices come from the client (bounded 0–1000); only songs are server-priced. | Medium | Add a **server-side catalog** of events/merch so prices can't be tampered. |
+| R5 | The server signing secret is auto-generated into `server/data/p2k.db`. | Medium | Ensure `server/data/` and `server/.env` are **never committed/backed up publicly** (already in `.gitignore`; the backup skill excludes them). Back up the SQLite file privately. |
+| R7 | Rate-limit + anti-fraud state is in-memory / single-instance; `TRUST_PROXY` trusts `X-Forwarded-For`. | Low/Med | Behind multiple instances use a shared store; set `TRUST_PROXY=true` **only** behind a proxy you control (else IPs can be spoofed). |
+
+---
+
+## 4. Business-logic caveats (not code bugs)
+
+- **B1 — Listen earnings are a *projection*, not received money.** The wallet
+  balance mixes verified sales (real) with a configurable listen royalty
+  (`LISTEN_RATE_PER_MIN`). If payouts move real funds, the listen portion is not
+  backed by actual revenue. Decide: treat listen earnings as **display-only**
+  (withdrawable = verified sales − payouts), or reconcile against **real** ad/
+  streaming income before it counts toward a payout.
+- **B2 — Payout destination.** Payouts target `p2key1@gmail.com`, the same address
+  used to *receive* sales. A PayPal Payout from the business account to itself is a
+  no-op. Confirm the intended personal-vs-business flow before enabling live payouts.
+- **B3 — Rights / licensing.** Several catalog tracks appear to be other artists' or
+  remixes (e.g. "Ketsa – Owned the Day", "DJ Meemx …", "dannyminus … Remix").
+  Selling them for $16 and running ads requires P2K to actually own/license them.
+  This is a legal matter, carried over from the prior review.
+
+---
+
+## 5. Deployment hardening checklist
+
+1. `cp server/.env.example server/.env`, set **`P2K_ADMIN_PASSCODE`**, start once, restart.
+2. Serve behind **HTTPS** and set `BEHIND_TLS=true` (Secure cookies + HSTS).
+3. Set real **`PAYPAL_CLIENT_ID` / `PAYPAL_SECRET`**, `PAYPAL_ENV=production`, and
+   `PAYPAL_WEBHOOK_ID`; complete the live-capture wiring (**R4**).
+4. Set `TRUST_PROXY` correctly for your hosting.
+5. Keep `server/.env` and `server/data/` **out of git/backups**; back up the SQLite DB privately.
+6. Resolve **B1** and **B2** before enabling real payouts.
+
+# Google AdSense Setup — p2k-music.ca
+
+This is the complete checklist to get real ads showing. **Ads will NOT appear until every step below is done AND Google approves the site.** Until then the ad areas stay blank — that's normal, not a bug.
+
+Publisher ID in use: **`ca-pub-2580922665149434`**
+
+---
+
+## ✅ What's already done in the code
+
+1. **Loader script** in `<head>` (loads Google's ad engine):
+   ```html
+   <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-2580922665149434" crossorigin="anonymous"></script>
+   ```
+2. **Two ad units** on the page — one between *News* and *Music*, one above the *footer* (styled, labelled "Advertisement", responsive).
+3. An **initializer script** that only activates ad units once they have a real slot ID (so the placeholders don't throw errors).
+4. **`ads.txt`** file in the project root.
+
+> ⚠️ **The one thing that was broken:** the original ad had `data-ad-slot="auto"`, which is not a valid slot ID, so it could never show an ad. It's now `REPLACE_WITH_AD_SLOT_ID` — you paste your real numeric slot ID there (step 4).
+
+---
+
+## 📋 What YOU need to do (in the AdSense dashboard)
+
+### 1. Confirm the AdSense account
+Sign in at <https://adsense.google.com> with the account that owns `ca-pub-2580922665149434`.
+- If that account is **your friend's**, either use his login, or create **your own** AdSense account and swap the ID everywhere it appears (it's in `index.html` in 3 spots and in `ads.txt`).
+
+### 2. Add the site
+AdSense ▸ **Sites** ▸ **Add site** → enter your domain (e.g. `p2k-music.ca`).
+The loader script already in `<head>` is what Google looks for to verify ownership.
+
+### 3. Upload `ads.txt`
+Make sure `ads.txt` ends up at the **root of the live site**: `https://YOURDOMAIN/ads.txt`.
+- GitHub Pages / Netlify / Vercel: keeping it beside `index.html` puts it at the root automatically.
+- Confirm by visiting the URL in a browser — you should see the `google.com, pub-…` line.
+
+### 4. Create ad units and paste the slot IDs
+AdSense ▸ **Ads** ▸ **By ad unit** ▸ **Display ads** → name it (e.g. "Home – in-content") → **Create**.
+Google shows a code snippet containing a number like `data-ad-slot="1234567890"`. **Copy that number.**
+
+In `index.html`, replace the placeholders:
+| Placeholder | Where |
+|---|---|
+| `REPLACE_WITH_AD_SLOT_ID`   | Ad unit #1 (between News & Music) |
+| `REPLACE_WITH_AD_SLOT_ID_2` | Ad unit #2 (before footer) |
+
+Create a separate ad unit for each and paste its own slot number. (Don't want two ads? Delete the entire "Ad unit #2" block.)
+
+### 5. Wait for approval
+New sites/accounts are reviewed by Google — usually **a few days, sometimes up to ~2 weeks**. You'll get an email. Ads only start showing **after approval** and **on the live domain** (not on `localhost`).
+
+---
+
+## 🅰️ Easier alternative: Auto ads
+If you don't want to manage individual units, turn on **Auto ads**:
+AdSense ▸ **Ads** ▸ **By site** ▸ toggle **Auto ads** on for the domain.
+Google then places ads automatically using only the `<head>` loader script — you can leave the manual `<ins>` blocks empty or delete them. (Downside: less control over exactly where ads land, which on a music site can mean an ad near the player.)
+
+---
+
+## ⚠️ Important — read before going live
+
+- **You only earn on the LIVE approved domain.** Blank ad boxes locally or before approval are expected.
+- **Never click your own ads** and never ask friends to — it's the #1 reason accounts get banned.
+- **Content/copyright:** AdSense will not monetize (and PayPal/labels can act against) content you don't own the rights to. Several tracks in the catalog look like other artists' songs / remixes. Before running ads **or** selling tracks for money, make sure P2K actually owns or is licensed for every track. This protects the account and avoids takedowns.
+- Keep ads away from anything clickable (the player, buy buttons) so users don't tap ads by accident — that also violates policy.
+
+---
+
+## 🔧 Troubleshooting "I don't see ads"
+1. Site not approved yet → wait for the email.
+2. Viewing on `localhost` → deploy to the real domain.
+3. `data-ad-slot` still says `REPLACE_WITH_…` → paste the real number (step 4).
+4. `ads.txt` not reachable at the domain root → re-check the deploy path.
+5. Ad blocker on in your browser → test in a clean/incognito window.
+6. Brand-new account → the very first ads can take 24–48h after approval to start filling.
+
+# ads.txt for p2k-music.ca
+# Authorizes Google to sell this site's ad inventory. Google (and most ad
+# networks) will not serve ads reliably without this file.
+#
+# It MUST be reachable at the ROOT of the live domain, e.g.:
+#     https://p2k-music.ca/ads.txt
+# (Keeping it next to index.html means it deploys to the root automatically.)
+#
+# Format:  <ad-system-domain>, <publisher-id>, <relationship>, <cert-authority-id>
+# The pub-ID below is P2K's AdSense publisher ID (from ca-pub-2580922665149434).
+# f08c47fec0942fa0 is Google's fixed certification-authority ID (same for everyone).
+
+google.com, pub-2580922665149434, DIRECT, f08c47fec0942fa0
+
+# P2K Music — Project Overview & Handoff
+
+**Repo:** https://github.com/p2k-music/p2k-music.com  ·  **Owner:** P2K (`tajallatajalla2@gmail.com`)
+**Site:** p2k-music.ca — P2K's official music artist website.
+**Last updated:** 2026-07-06.
+
+This is the single reference for the whole project: what it is, how to run it, every
+feature, the backend API, configuration, security, and what's left to do. If you're a
+new Claude/AI session or a new developer, **start here**, then see
+[`CLAUDE.md`](CLAUDE.md) (quick orientation), [`SECURITY-AUDIT.md`](SECURITY-AUDIT.md),
+and [`server/README.md`](server/README.md).
+
+---
+
+## 1. What it is
+
+A music artist website with a real backend. Fans can stream previews and buy tracks,
+tickets, and merch; there's a podcast, tour dates, gallery, news, an admin CMS, an
+earnings wallet, and a bonus in-browser file converter. Visual style: cyan/coral/gold
+neon + glassmorphism, Orbitron/Inter fonts, animated aurora background.
+
+## 2. Quick start (run it)
+
+- **Requires Node 22+** (uses the built-in `node:sqlite`). Developed/tested on Node 26.
+- No `npm install` — the backend uses only Node built-ins.
+```
+node server/server.js
+```
+Then open **http://localhost:8123**. First run creates `server/data/p2k.db` and seeds
+config. Out of the box it runs in **DEMO mode** (PayPal + email are simulated/off) so
+everything is testable locally.
+
+Config lives in **`server/.env`** (copy from `server/.env.example`). `server/.env` and
+`server/data/` are git-ignored — never commit them.
+
+> The `.claude/launch.json` "p2k-site" config runs exactly this (`node server/server.js`).
+
+## 3. Architecture
+
+- **Frontend** — a static, multi-page site. **Every page shares `assets/styles.css` +
+  `assets/app.js`** (the entire client). All client data persists in the browser via
+  **IndexedDB** (`p2kMusicDB`, `DB_VERSION` 6): songs, images, purchases, tickets,
+  events, podcast, guests, revenue, settings. **Rule: change shared behaviour in
+  `assets/`, never per-page.**
+- **Backend** — `server/`, Node built-ins only (`http`, `crypto`, `node:sqlite`,
+  `tls`). Serves the static site **and** a JSON API. Source of truth for money/admin/
+  tickets is the server; SQLite DB at `server/data/p2k.db`.
+- **Pages** — `index.html` (Home), `about`, `music`, `podcast`, `videos`, `tour`,
+  `gallery`, `merch`, `news`, `contact`, `admin`, and `converter/` (the file converter).
+  Nav active-state via `<body data-page="…">`; a "Converter" link is injected into the
+  nav/footer by `app.js`.
+
+## 4. File map
+
+| Path | What it is |
+|---|---|
+| `index.html`, `about.html`, `music.html`, `podcast.html`, `videos.html`, `tour.html`, `gallery.html`, `merch.html`, `news.html`, `contact.html`, `admin.html` | The site pages (share the assets below) |
+| `assets/styles.css` | The entire design system + all component styles |
+| `assets/app.js` | The entire client app (player, IndexedDB, admin, wallet, tickets, visuals, API calls) |
+| `audio/` | 48 real tracks (mp3/mp4). 5 catalog entries have no file yet and auto-hide |
+| `background.jpg` | The ribbon photo used as the site background (1920×1080, optimized) |
+| `converter/index.html` | Standalone P2K-styled file converter tool |
+| `server/config.js` | Config loader (reads `server/.env` + env) |
+| `server/db.js` | SQLite schema + wallet math (money in integer cents) |
+| `server/auth.js` | scrypt hashing, HMAC signed cookies, CSRF, rate limiting |
+| `server/http.js` | Security headers/CSP + hardened static server (Range streaming, traversal guard) |
+| `server/paypal.js` | PayPal Orders v2 + Payouts v1 (+ webhook), live or demo |
+| `server/email.js` | Zero-dependency SMTP-over-TLS sender for 2FA codes (+ demo fallback) |
+| `server/server.js` | The HTTP router (ties it all together) |
+| `server/.env.example` | All config options, documented |
+| `server/README.md` | Backend run/config/API summary |
+| `SECURITY-AUDIT.md` | Full security posture, residual risks, go-live checklist |
+| `.claude/launch.json` | Dev-server launch config (`node server/server.js`) |
+| `.claude/skills/backup-github/` | "back up"/"push the site" skill: `git add -A` → timestamped commit → push |
+| `ads.txt`, `ADSENSE-SETUP.md` | Google AdSense (publisher `ca-pub-2580922665149434`) |
+
+## 5. Features (everything built)
+
+- **Music catalog & player** — 53-track catalog (`DEFAULT_SONGS` in `app.js`); 48 have
+  real files and play (30-second preview for non-owners; full track after purchase).
+  `checkFileAvailability()` HEAD-checks each file and hides missing ones. Search/sort
+  library bar on the Music page. Live Web-Audio visualizer + energy-swirl on the player.
+- **Background visuals** — animated **aurora-orb nebula** (`#auroraField`, 6 drifting
+  colour orbs) + a glowing multi-colour **particle constellation** with cursor parallax,
+  layered over the ribbon **`background.jpg`** (tuned opacity + dark scrim for readability).
+- **File converter** (`converter/`) — drag-and-drop image/audio/video/doc converter;
+  real canvas image conversion, a credit system (localStorage), P2K neon-glass styled.
+- **Admin area** (`admin.html`) — CMS to upload songs/images/background, publish news &
+  podcast episodes, announce shows, run the door check-in scanner, and see the earnings
+  wallet + profit dashboard. Gated by the 2FA login (§7).
+- **Earnings wallet + payouts** — server-computed balance from verified sales + a
+  configurable listen-royalty; withdraw via PayPal Payouts (atomic reservation,
+  idempotent). Admin-only.
+- **Payments** — songs ($16 CAD), tickets, merch via PayPal. Server creates + verifies
+  the order before unlocking (live) / simulates (demo). Revenue recorded server-side.
+- **Ticketing** — server-issued, HMAC-signed tickets with a QR that points at
+  `/t/:code`; validate + one-time check-in from any device (fixes cross-device door scan).
+- **Podcast / News / Gallery / Merch / Tour** — admin publishes; fans view/buy/apply.
+- **AdSense + cookie consent** — ads gated behind a cookie-consent banner.
+
+## 6. Backend API
+
+| Method & path | Auth | Purpose |
+|---|---|---|
+| `GET  /api/health` | — | mode + currency |
+| `POST /api/admin/login` `{email,password}` | — | step 1: verify + email a one-time code |
+| `POST /api/admin/verify` `{challenge,code}` | — | step 2: verify code → session (+CSRF) |
+| `POST /api/admin/logout` | cookie | end session |
+| `GET  /api/admin/session` | — | `{admin, email, csrf}` |
+| `GET  /api/earnings` | admin | wallet summary |
+| `POST /api/withdraw` `{amount}` | admin + CSRF | PayPal payout |
+| `POST /api/listen-tick` | visitor | accrue listen earnings (anti-fraud) |
+| `POST /api/orders` `{kind,ref,…}` | — | create a (PayPal) order |
+| `POST /api/orders/:id/capture` | — | verify payment → unlock / issue ticket |
+| `GET  /api/ticket/:code` | — | validate a ticket (door scanner) |
+| `POST /api/ticket/:code/checkin` | admin + CSRF | mark ticket used |
+| `POST /api/tickets/issue` | admin + CSRF | issue a comp/manual ticket |
+| `GET  /api/revenue` | admin | verified revenue summary |
+| `POST /api/paypal/webhook` | signature | reconciliation (live) |
+| `GET  /t/:code` | — | public ticket-status page (the QR target) |
+
+## 7. Admin login — two accounts + email 2FA (hardened, fail-closed)
+
+- **Two accounts:** `tajallatajalla2@gmail.com` (P2K) and `aaron.styles9393@gmail.com`
+  (Aaron). Each logs in with **email + password**, then a **6-digit one-time code**.
+- Passwords are scrypt-hashed; codes are hashed, expire in 5 min, attempt-capped,
+  and one-time. The session records which admin signed in.
+- **Fail-closed:** the code is **only ever emailed**. The on-screen fallback is gated
+  behind `DEV_SHOW_CODE` **and** is localhost-only, so a remote user can never see it.
+  **With no SMTP configured, login returns `503` even for a correct password** — so you
+  need the password *and* access to the email inbox.
+- **Brute-force defence:** per-IP rate limiting + per-account lockout
+  (`LOCK_THRESHOLD`/`LOCK_MINUTES`). Unknown email and wrong password return the same
+  generic `401` (no user enumeration).
+- **⚠️ To actually log in, SMTP must be configured** (see §8) so codes reach the inbox —
+  otherwise the site is intentionally locked for everyone.
+
+## 8. Configuration (`server/.env`)
+
+Copy `server/.env.example` → `server/.env`. Key settings:
+
+| Var | Meaning |
+|---|---|
+| `ADMIN1_EMAIL` / `ADMIN1_PASS`, `ADMIN2_EMAIL` / `ADMIN2_PASS` | The two admin accounts (blank password → generated + logged once) |
+| `SMTP_HOST/PORT/USER/PASS/FROM` | Email sender for 2FA codes. **Gmail:** `SMTP_USER` = a gmail, `SMTP_PASS` = a Google **App Password**. Required in production |
+| `DEV_SHOW_CODE` | Localhost-only dev flag to show the code on-screen. **Leave unset in production** |
+| `CODE_TTL_MIN`, `CODE_MAX_ATTEMPTS`, `LOCK_THRESHOLD`, `LOCK_MINUTES` | 2FA / lockout tuning |
+| `PAYPAL_CLIENT_ID` / `PAYPAL_SECRET` | Set both to go **live** (else DEMO). `PAYPAL_ENV` = `sandbox`/`production` |
+| `PAYOUT_EMAIL` | Where withdrawals are sent (`p2key1@gmail.com`) |
+| `SONG_PRICE`, `CURRENCY`, `MIN_WITHDRAW`, `LISTEN_RATE_PER_MIN` | Money settings |
+| `BEHIND_TLS` | `true` when served over HTTPS (Secure cookies + HSTS) |
+
+## 9. Security
+
+The backend replaced a client-only site where the admin passcode lived in JS, payments
+were an honor-system button, and tickets were forgeable. Now: server-verified 2FA admin
+auth, PayPal-verified payments, HMAC-signed tickets, anti-fraud listen wallet, PayPal
+payouts, CSP + security headers, Range-streaming static server with traversal guard.
+**Full detail + residual risks in [`SECURITY-AUDIT.md`](SECURITY-AUDIT.md).**
+
+## 10. Go-live checklist
+
+1. `cp server/.env.example server/.env`; set the two admin passwords.
+2. **Configure SMTP** (`SMTP_USER` + a Google App Password) so 2FA codes email — until
+   then nobody can log in.
+3. Serve behind **HTTPS**; set `BEHIND_TLS=true`.
+4. For real payments: set `PAYPAL_CLIENT_ID`/`SECRET`, `PAYPAL_ENV=production`, a webhook
+   id, and finish the live-capture wiring (SECURITY-AUDIT R4).
+5. Confirm the PayPal payout account vs receive account (SECURITY-AUDIT B2) and how listen
+   earnings count toward withdrawals (B1).
+6. Drop in the 5 missing tracks (below) if desired.
+
+## 11. Outstanding / caveats
+
+- **5 catalog tracks have no audio file** (auto-hidden until added): `DEEZY ME !.mp3`,
+  `P2K EKA JENVA !.mp3`, `p2k sec verse diferrent flow Top Of The World.mp3`,
+  `p2k_freestyle_7.mp3`, `p2k_haupate^^.mp3` — drop real files into `audio/` with these
+  exact names and they reappear.
+- **Rights/licensing:** some catalog tracks look like other artists'/remixes — selling
+  them + running ads needs P2K to own/license them (legal, not code).
+- Residual security items (see audit): gate raw `audio/` download URLs (R2), server-side
+  event/merch pricing (R3), ~~PayPal JS SDK for real capture (R4)~~ **DONE — real
+  approve→capture checkout is wired (see §15)**, listen-earnings are a projection (B1),
+  same-account payout question (B2).
+- ~~PR #1 (`admin-2fa-login`)~~ — **merged into `main`** (commit `dade236`).
+
+## 12. Backups & GitHub
+
+- Remote `origin` = `https://github.com/p2k-music/p2k-music.com.git`. Git Credential
+  Manager auth is cached (push works). **Commit as P2K** (`P2K <tajallatajalla2@gmail.com>`).
+- Backup skill: say "back up" / "push the site" → it stages, timestamped-commits, pushes.
+- `.gitignore` excludes secrets (`server/.env`), runtime data (`server/data/`), zips, and
+  raw upload dupes.
+
+## 13. What was done this session (2026-07-06)
+
+Added the 48 real tracks; re-envisioned the background (aurora + constellation + ribbon
+photo); built the entire zero-dependency Node backend (auth, PayPal payments, wallet,
+payouts, tickets) + `SECURITY-AUDIT.md`; restyled the file converter into the site theme
+and linked it; pushed the project to GitHub and re-credited all history to P2K; then
+built the **two-account email-2FA admin login** and hardened it (fail-closed, lockout,
+no enumeration) — merged as PR #1.
+
+**Enterprise-hardening pass (later on 2026-07-06)** — full multi-agent audit, every
+finding verified, then fixed:
+- **Server security**: case-insensitive static-server block-list (Windows/macOS `/SERVER/…`
+  could previously download the SQLite DB + signing secret); malformed-cookie 500 fixed;
+  `Cache-Control: no-store` on all API JSON; webhook body size-capped; lockout state now
+  revealed only after a correct password (no enumeration/lock oracle).
+- **Money integrity**: order capture made idempotent under concurrent requests (no double
+  revenue rows); PayPal capture rejects a missing/wrong `currency_code` (fail closed);
+  listen-tick no longer counts a freshly minted visitor identity (cookie-mint bypass of
+  the per-visitor cap closed).
+- **Ops**: fail-fast config validation at boot; deep `/api/health` (DB probe + uptime);
+  structured request logging (`LOG_REQUESTS`); graceful SIGINT/SIGTERM drain;
+  uncaughtException/unhandledRejection logging; header/request/keep-alive timeouts;
+  SQLite `synchronous=NORMAL` + `busy_timeout` + retention pruning (login codes, ip_day,
+  dormant visitors); SMTP client no longer hangs on clean disconnect and accepts a
+  display-name `SMTP_FROM`; legacy single-passcode code path removed.
+- **Front end**: all dynamic renders now HTML-escape (song titles, comments, news,
+  gallery); dead duplicate `updateAdminUI` removed; admin page prompts login from the
+  server session (legacy localStorage gate removed); placeholder AdSense units hidden;
+  News added to the navbar (+ active-state CSS); favicon + Open Graph/Twitter cards on
+  every page; keyboard access + aria-labels on cards/forms; `prefers-reduced-motion` +
+  `:focus-visible` support; track count corrected to 53; admin copy matches the 2FA flow;
+  contact page license contradiction fixed (all rights reserved, licensing via booking).
+- **Repo**: removed cruft (`index - Copy.html`, `index.original.backup.html`,
+  `p2k website instruct.txt` — the last was publicly web-served).
+
+## 16. Cloudflare Workers backend (`worker/`)
+
+A faithful edge port of `server/` on **D1** (SQLite at the edge) — global, ~free,
+no server to run. Same security model, verified on real workerd + D1. The Node
+backend (`server/`) still works for local dev; the Worker is the primary deploy
+target. Mapping + deploy steps: [`worker/README.md`](worker/README.md) and
+[`DEPLOY.md`](DEPLOY.md) §0. Highlights: scrypt→PBKDF2 (WebCrypto), in-memory
+rate-limit→D1 fixed-window, `node:tls` SMTP→`cloudflare:sockets`, filesystem
+static→Workers Assets (only git-tracked public files are staged via
+`build-assets.mjs`; backend/secrets/history are never uploaded), prune
+`setInterval`→cron `scheduled()`. D1 database `p2k-music` already created.
+
+## 15. End-to-end PayPal checkout (R4 closed)
+
+Real buyer-approval checkout replaces the old honor-system `_xclick` links.
+
+- **Live mode** (both PayPal creds set): pages load the PayPal **JS SDK Buttons**. The
+  buyer approves in PayPal's popup; the server **creates** the order (`POST /api/orders`,
+  server-authoritative song price) and **captures + verifies** it
+  (`POST /api/orders/:id/capture`) before anything unlocks. Songs, paid tickets, and
+  merch all run through one shared `mountCheckout()` helper in `assets/app.js`.
+- **Demo mode** (no live creds): the same helper renders a "Pay with PayPal — demo"
+  button that drives the identical server create→capture path (simulated), so the flow
+  is fully testable locally. The site auto-switches to real Buttons the moment both
+  `PAYPAL_CLIENT_ID` + `PAYPAL_SECRET` are set (server restart).
+- **Free RSVP tickets** ($0) skip PayPal entirely and still get a server-signed ticket.
+- New `GET /api/config` exposes `mode` + the **public** PayPal client id (only when
+  live). CSP extended with `*.paypalobjects.com` for the SDK.
+- **Config**: set `PAYPAL_CLIENT_ID` + `PAYPAL_SECRET` (+ `PAYPAL_ENV=sandbox` to test,
+  `production` to go live) in `server/.env`. Client id is public; the secret is not.
+- **Still open**: event/merch prices are client-supplied (R3) — a server-side product
+  catalog would let capture re-price authoritatively; recommended before high volume.
+
+## 14. Working on this project with Claude
+
+- **Identity:** always commit/push as **P2K** (`git config user.name "P2K"`,
+  `user.email "tajallatajalla2@gmail.com"`); the remote is P2K's. Never author as Aaron.
+- **Shared code:** edit `assets/styles.css` / `assets/app.js`, not per-page copies.
+- **Run/verify:** `node server/server.js`; it's DEMO-safe with no external accounts.
+- **Secrets:** never commit `server/.env` or `server/data/`; never paste passwords/tokens
+  into chat.
+- **Money:** the server is the source of truth (integer cents); don't trust client totals.
+
+# Deploying p2k-music.ca
+
+The site is a static front end **plus a required backend** (payments, tickets, admin
+2FA, wallet). There are two supported backends — pick one:
+
+- **Cloudflare Workers + D1** (`worker/`) — global edge, ~free, no server to run.
+  **This is the primary target.** Full guide: [`worker/README.md`](worker/README.md).
+- **Node 22+ server** (`server/`) — a persistent process with a persistent disk
+  (Render / Fly / VPS). Guide below.
+
+Either way, plain static hosting (GitHub Pages / Netlify static) will NOT work — the
+API is required.
+
+---
+
+## Option 0 — Cloudflare Workers + D1 (recommended, DNS already on Cloudflare)
+
+```sh
+cd worker
+wrangler d1 execute p2k-music --remote --file schema.sql   # schema (D1 already created)
+wrangler secret put SESSION_SECRET     # + ADMIN1_PASS ADMIN2_PASS SMTP_USER SMTP_PASS
+wrangler secret put PAYPAL_CLIENT_ID   # + PAYPAL_SECRET PAYPAL_WEBHOOK_ID
+wrangler deploy
+```
+Then Workers → Settings → Domains & Routes → add `p2k-music.ca` + `www`. Certificate is
+automatic. See [`worker/README.md`](worker/README.md) for the full walkthrough and how
+the Node↔Worker pieces map.
+
+The rest of this doc covers the **Node** backend option.
+
+---
+
+> ⚠️ Never deploy `server/.env` or `server/data/` — secrets go into the host's
+> environment-variable dashboard, and the database lives on the host's persistent disk.
+
+## Environment variables for production
+
+| Var | Value | Why |
+|---|---|---|
+| `BEHIND_TLS` | `true` | Host terminates HTTPS → Secure cookies + HSTS |
+| `TRUST_PROXY` | `true` | Real client IPs from `X-Forwarded-For` (rate limits, anti-fraud) |
+| `DATA_DIR` | `/data` (or the host's disk mount) | SQLite must live on the persistent disk |
+| `ADMIN1_PASS` / `ADMIN2_PASS` | strong passwords | The two admin logins |
+| `SMTP_USER` / `SMTP_PASS` | gmail + Google **App Password** | 2FA codes — **without this nobody can log in** (fail-closed) |
+| `PAYPAL_CLIENT_ID` / `PAYPAL_SECRET` | from developer.paypal.com (Live app) | Real payments; leave blank = demo mode |
+| `PAYPAL_ENV` | `production` (`sandbox` to test) | Which PayPal API |
+| `PAYPAL_WEBHOOK_ID` | from PayPal webhooks dashboard | Webhook signature verification |
+
+## Option A — Render.com (recommended: simplest)
+
+1. Push the repo to GitHub (already done: `p2k-music/p2k-music.com`).
+2. render.com → **New → Blueprint** → connect the repo. Render reads
+   [`render.yaml`](render.yaml): Node 22, 1 GB persistent disk at `/data`,
+   health check on `/api/health`.
+3. In the service's **Environment** tab fill in the secrets marked `sync: false`
+   (admin passwords, SMTP, PayPal).
+4. Deploy. Verify `https://<service>.onrender.com/api/health` returns `"ok":true`.
+5. **Custom domain**: service → Settings → Custom Domains → add `p2k-music.ca` and
+   `www.p2k-music.ca`, then create the CNAME/A records Render shows you at the domain
+   registrar. HTTPS certificates are automatic.
+
+Cost: the persistent disk requires a paid instance (~US$7/mo). Free tier has no disk —
+the database (sales! tickets!) would be wiped on every deploy, so don't use it.
+
+## Option B — Fly.io (cheap, uses the Dockerfile)
+
+```sh
+fly launch --no-deploy        # detects the Dockerfile; pick a region near Toronto (yyz)
+fly volumes create p2k_data --size 1
+# in fly.toml add:  [mounts]  source = "p2k_data"  destination = "/data"
+fly secrets set ADMIN1_PASS=... ADMIN2_PASS=... SMTP_USER=... SMTP_PASS=... \
+  PAYPAL_CLIENT_ID=... PAYPAL_SECRET=... PAYPAL_ENV=production BEHIND_TLS=true TRUST_PROXY=true
+fly deploy
+fly certs add p2k-music.ca && fly certs add www.p2k-music.ca   # then set DNS as shown
+```
+
+## Option C — Your own VPS / home server
+
+1. Install Node 22+, clone the repo, `cp server/.env.example server/.env` and fill it in
+   (`BEHIND_TLS=true`, `TRUST_PROXY=true`).
+2. Run it as a service (systemd):
+   ```ini
+   [Unit]
+   Description=p2k-music.ca
+   After=network.target
+   [Service]
+   WorkingDirectory=/opt/p2k-music.com
+   ExecStart=/usr/bin/node server/server.js
+   Restart=always
+   User=p2k
+   [Install]
+   WantedBy=multi-user.target
+   ```
+3. Put **Caddy** in front for automatic HTTPS (`Caddyfile`):
+   ```
+   p2k-music.ca, www.p2k-music.ca {
+       reverse_proxy 127.0.0.1:8123
+   }
+   ```
+4. Point the domain's A record at the server's IP.
+
+Docker variant: `docker build -t p2k-music . && docker run -d --restart=always \
+  -p 127.0.0.1:8123:8123 -v p2k-data:/data --env-file server/.env p2k-music`
+
+## Post-deploy checklist
+
+1. `GET /api/health` → `{"ok":true,"mode":"live",...}` (`mode:"demo"` means PayPal
+   creds are missing/wrong).
+2. Admin login works end-to-end (needs SMTP — codes arrive by email only).
+3. Buy a track with PayPal **sandbox** creds first; confirm the revenue row appears in
+   the admin wallet; then switch to live creds.
+4. `GET /SERVER/data/p2k.db` returns **404** (static-server block list).
+5. Backups: the SQLite DB is a single file (`$DATA_DIR/p2k.db`) — schedule a periodic
+   copy off the host (it's your sales + ticket ledger).
+
+# Build artifacts / downloads (regenerable — keep out of the backup)
+*.zip
+
+# OS / editor cruft
+Thumbs.db
+ehthumbs.db
+.DS_Store
+Desktop.ini
+*.swp
+*~
+
+# Local tooling (safe to keep out of the backup)
+.claude/settings.local.json
+
+# Backend secrets + runtime state (NEVER commit these)
+server/.env
+server/data/
+
+# The raw upload folder (real files now live in audio/)
+Audio-Files/
+
+# Full-res background source (the optimized background.jpg is what the site uses)
+aromantic-asexual-4096x2304-11873.jpg
+
+# NOTE: the audio/ folder is intentionally NOT ignored — the whole point of the
+# backup is to save P2K's tracks. Make sure audio/ holds the REAL .mp3/.mp4 files
+# (not the 1-byte preview placeholders) before running a backup you care about.
+
+# Wrangler asset staging (generated by worker/build-assets.mjs)
+worker/public/
+worker/.dev.vars
+worker/.wrangler/
+
+# ============================================================
+#  Render.com blueprint — deploys the whole site in one click.
+#  New > Blueprint > pick this repo. See DEPLOY.md for the full guide.
+# ============================================================
+services:
+  - type: web
+    name: p2k-music
+    runtime: node
+    plan: starter            # persistent disk requires a paid instance (~US$7/mo)
+    buildCommand: ""         # zero dependencies — nothing to install or build
+    startCommand: node server/server.js
+    healthCheckPath: /api/health
+    disk:
+      name: p2k-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: NODE_VERSION
+        value: "22.12.0"
+      - key: DATA_DIR
+        value: /data
+      - key: BEHIND_TLS       # Render terminates HTTPS in front of us
+        value: "true"
+      - key: TRUST_PROXY      # honour X-Forwarded-For from Render's proxy
+        value: "true"
+      # Secrets — set these in the Render dashboard (sync: false keeps them out of git):
+      - key: ADMIN1_PASS
+        sync: false
+      - key: ADMIN2_PASS
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_SECRET
+        sync: false
+      - key: PAYPAL_ENV
+        value: production
+      - key: PAYPAL_WEBHOOK_ID
+        sync: false
+
+.git
+.gitignore
+.claude
+.project-memory
+server/.env
+server/data
+Dockerfile
+.dockerignore
+render.yaml
+*.zip
+
+# ============================================================
+#  p2k-music.ca — production image (zero npm dependencies)
+#  Build:  docker build -t p2k-music .
+#  Run:    docker run -p 8123:8123 -v p2k-data:/data --env-file server/.env p2k-music
+# ============================================================
+FROM node:22-alpine
+
+WORKDIR /app
+COPY . .
+
+# SQLite + runtime state live on the mounted volume, never in the container layer.
+ENV NODE_ENV=production \
+    HOST=0.0.0.0 \
+    PORT=8123 \
+    DATA_DIR=/data
+
+RUN mkdir -p /data && chown -R node:node /data /app
+USER node
+VOLUME ["/data"]
+EXPOSE 8123
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:8123/api/health || exit 1
+
+CMD ["node", "server/server.js"]
+
+# CLAUDE.md — p2k-music.com
+
+Project guidance for Claude. **Read [`PROJECT-OVERVIEW.md`](PROJECT-OVERVIEW.md) first**
+for the full picture (features, file map, API, config, security, TODOs).
+
+## What this is
+P2K's music artist website (p2k-music.ca): a static multi-page front end + a
+zero-dependency Node backend. Sells tracks/tickets/merch (PayPal), plus podcast, tour,
+gallery, admin CMS, earnings wallet, and an in-browser file converter.
+
+## Run it
+- Node 22+ required (uses built-in `node:sqlite`). No `npm install`.
+- `node server/server.js` → serves the whole site + API at http://localhost:8123.
+- Config: `server/.env` (copy `server/.env.example`). Runs in **DEMO mode** with no
+  external accounts (PayPal + email simulated/off), so it's safe to run and test locally.
+
+## Architecture (know this before editing)
+- **Front end is multi-page and shares `assets/styles.css` + `assets/app.js`.** Change
+  shared behaviour there, **never per-page**. Client data persists in IndexedDB
+  (`p2kMusicDB`).
+- **Backend** = `server/` (Node built-ins only): `config.js`, `db.js` (SQLite, money in
+  integer cents), `auth.js` (scrypt/cookies/CSRF/rate-limit), `http.js` (headers + static
+  server), `paypal.js`, `email.js`, `server.js` (router). The **server is the source of
+  truth** for money/admin/tickets — don't trust client totals.
+
+## Conventions / must-dos
+- **Identity — commit & push as P2K, never Aaron:**
+  `git config user.name "P2K"` and `user.email "tajallatajalla2@gmail.com"`.
+  Remote `origin` is `github.com/p2k-music/p2k-music.com`. Backup: say "back up" / "push
+  the site" (the `backup-github` skill).
+- **Secrets:** never commit `server/.env` or `server/data/` (git-ignored); never paste
+  passwords/tokens into chat.
+- **Verify changes** by running `node server/server.js` and checking the page/API.
+
+## Admin login is 2FA + fail-closed
+Two accounts (P2K + Aaron emails), email + password, then a 6-digit code that is **only
+emailed**. **With no SMTP configured, login is intentionally blocked (503) even with the
+right password** — set `SMTP_USER` + a Google App Password in `server/.env` to enable it.
+`DEV_SHOW_CODE=1` shows the code on-screen for localhost dev only.
+
+## Current state / next steps
+- 2FA login (PR #1) is **merged into `main`**; a full audit + enterprise-hardening pass
+  landed 2026-07-06 (see `PROJECT-OVERVIEW.md` §13).
+- To make admin usable: configure SMTP. To take payments: add PayPal live creds. For
+  production: HTTPS + `BEHIND_TLS=true`.
+- See `SECURITY-AUDIT.md` for the full go-live checklist and residual risks.
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Podcast — p2k-music.ca</title>
+    <meta name="description" content="The P2K Podcast — episodes, guests, and how to join the show.">
+    <meta name="theme-color" content="#05060d">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%2305060d'/%3E%3Ccircle cx='32' cy='32' r='24' fill='none' stroke='%2300d4ff' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='%23ff2d95' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%23ffc439'/%3E%3C/svg%3E">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="p2k-music.ca">
+    <meta property="og:title" content="The P2K Podcast">
+    <meta property="og:description" content="The P2K Podcast — episodes, guests, and how to join the show.">
+    <meta property="og:url" content="https://p2k-music.ca/podcast.html">
+    <meta property="og:image" content="https://p2k-music.ca/background.jpg">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-2580922665149434" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body data-page="podcast">
+    <div id="loader"><div class="loader-logo">p2k-music</div><div class="loader-bar"><span></span></div><div class="loader-sub">Loading the sound</div></div>
+    <div id="scrollProgress"></div>
+    <div id="cursorGlow"></div>
+    <canvas id="fxParticles"></canvas>
+    <canvas id="pageViz" class="page-viz"></canvas>
+    <div class="custom-bg" id="customBg" style="background-image: url('background.jpg');"></div>
+    <nav class="navbar" id="navbar">
+        <div class="nav-container">
+            <a href="index.html" class="logo"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+            <ul class="nav-links" id="navLinks">
+                <li><a class="navlink" data-nav="home" href="index.html">Home</a></li>
+                <li><a class="navlink" data-nav="about" href="about.html">About</a></li>
+                <li><a class="navlink" data-nav="music" href="music.html">Music</a></li>
+                <li><a class="navlink" data-nav="podcast" href="podcast.html">Podcast</a></li>
+                <li><a class="navlink" data-nav="videos" href="videos.html">Videos</a></li>
+                <li><a class="navlink" data-nav="tour" href="tour.html">Tour</a></li>
+                <li><a class="navlink" data-nav="gallery" href="gallery.html">Gallery</a></li>
+                <li><a class="navlink" data-nav="merch" href="merch.html">Merch</a></li>
+                <li><a class="navlink" data-nav="news" href="news.html">News</a></li>
+                <li><a class="navlink" data-nav="contact" href="contact.html">Contact</a></li>
+            </ul>
+            <div class="nav-right">
+                <span class="admin-badge" id="adminBadge" style="display:none;"><i class="fas fa-shield-alt"></i> Admin</span>
+                <button class="logout-btn" id="logoutBtn" onclick="logout()">Logout</button>
+                <a class="admin-button" id="adminLoginBtn" href="admin.html">Admin</a>
+                <div class="mobile-toggle" id="mobileToggle"><i class="fas fa-bars"></i></div>
+            </div>
+        </div>
+    </nav>
+    <main class="page-main" style="padding-top: calc(var(--nav-h) + 0.5rem);">
+<section id="podcast" class="section">
+        <div class="section-head">
+            <span class="section-kicker">Tune In</span>
+            <h2 class="section-title">The P2K Podcast</h2>
+            <p class="section-sub">Conversations from the underground — beats, stories and guests from the scene. New episodes drop regularly.</p>
+        </div>
+        <div class="podcast-grid" id="podcastGrid"><!-- episodes rendered here --></div>
+
+        <div class="guest-cta reveal">
+            <div class="guest-cta-inner">
+                <h3><i class="fas fa-microphone"></i> Want to be on the show?</h3>
+                <p>Artist, producer, or just got a story worth telling? Pitch yourself as a guest and P2K will reach out.</p>
+                <form class="guest-form" onsubmit="submitGuestApplication(event)">
+                    <div class="guest-form-row">
+                        <input type="text" id="guestName" placeholder="Your name / artist name" aria-label="Your name or artist name" required>
+                        <input type="email" id="guestEmail" placeholder="Email" aria-label="Email address" required>
+                    </div>
+                    <input type="text" id="guestLinks" placeholder="Links — SoundCloud, IG, etc. (optional)" aria-label="Links to your music or socials, optional">
+                    <textarea id="guestTopic" placeholder="What do you want to talk about on the show?" aria-label="What do you want to talk about on the show" required></textarea>
+                    <button type="submit" class="cta-button" style="justify-content:center;"><i class="fas fa-paper-plane"></i> Apply to Join the Show</button>
+                </form>
+            </div>
+        </div>
+    </section>
+    </main>
+
+    <div class="floating-music" id="floatingPlayer">
+        <div style="display:flex; align-items:center; gap:1rem;">
+            <button class="play-btn" id="globalPlayBtn" style="width:42px; height:42px;"><i class="fas fa-play"></i></button>
+            <div style="flex:1;">
+                <div style="display:flex; align-items:center; gap:0.6rem;">
+                    <div class="eq"><span></span><span></span><span></span><span></span></div>
+                    <div id="currentSongTitle" style="font-size:0.9rem; font-weight:600;">No song playing</div>
+                </div>
+                <div class="progress-bar" id="globalProgress" style="margin-top:0.5rem;"><div class="progress-fill" id="globalProgressFill"></div></div>
+            </div>
+        </div>
+    </div>
+    <button id="backToTop" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Back to top"><i class="fas fa-arrow-up"></i></button>
+    <div class="cookie-banner" id="cookieBanner">
+        <div class="cookie-text"><strong><i class="fas fa-cookie-bite"></i> Cookies</strong>We use cookies for analytics and to show ads that help keep the music free. You can accept or reject — your choice is remembered.</div>
+        <div class="cookie-actions"><button class="cookie-btn reject" onclick="setCookieConsent('rejected')">Reject</button><button class="cookie-btn accept" onclick="setCookieConsent('accepted')">Accept</button></div>
+    </div>
+    <footer class="footer">
+        <a href="index.html" class="logo" style="font-size:1.5rem; justify-content:center;"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+        <div class="footer-nav">
+            <a href="about.html">About</a><a href="music.html">Music</a><a href="podcast.html">Podcast</a><a href="videos.html">Videos</a><a href="tour.html">Tour</a><a href="gallery.html">Gallery</a><a href="merch.html">Merch</a><a href="news.html">News</a><a href="contact.html">Contact</a><a href="admin.html">Admin</a><a href="#" onclick="openCookieSettings(); return false;">Cookie Settings</a>
+        </div>
+        <p class="fine">&copy; 2024 p2k-music.ca — All rights reserved. Professional Artist Portfolio &amp; Music Platform.</p>
+    </footer>
+
+    <script src="assets/app.js"></script>
+</body>
+</html>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tour — p2k-music.ca</title>
+    <meta name="description" content="P2K live dates. Buy a ticket and get a QR pass generated on the spot.">
+    <meta name="theme-color" content="#05060d">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%2305060d'/%3E%3Ccircle cx='32' cy='32' r='24' fill='none' stroke='%2300d4ff' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='%23ff2d95' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%23ffc439'/%3E%3C/svg%3E">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="p2k-music.ca">
+    <meta property="og:title" content="Tour & Shows — P2K">
+    <meta property="og:description" content="P2K live dates. Buy a ticket and get a QR pass generated on the spot.">
+    <meta property="og:url" content="https://p2k-music.ca/tour.html">
+    <meta property="og:image" content="https://p2k-music.ca/background.jpg">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-2580922665149434" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body data-page="tour">
+    <div id="loader"><div class="loader-logo">p2k-music</div><div class="loader-bar"><span></span></div><div class="loader-sub">Loading the sound</div></div>
+    <div id="scrollProgress"></div>
+    <div id="cursorGlow"></div>
+    <canvas id="fxParticles"></canvas>
+    <canvas id="pageViz" class="page-viz"></canvas>
+    <div class="custom-bg" id="customBg" style="background-image: url('background.jpg');"></div>
+    <nav class="navbar" id="navbar">
+        <div class="nav-container">
+            <a href="index.html" class="logo"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+            <ul class="nav-links" id="navLinks">
+                <li><a class="navlink" data-nav="home" href="index.html">Home</a></li>
+                <li><a class="navlink" data-nav="about" href="about.html">About</a></li>
+                <li><a class="navlink" data-nav="music" href="music.html">Music</a></li>
+                <li><a class="navlink" data-nav="podcast" href="podcast.html">Podcast</a></li>
+                <li><a class="navlink" data-nav="videos" href="videos.html">Videos</a></li>
+                <li><a class="navlink" data-nav="tour" href="tour.html">Tour</a></li>
+                <li><a class="navlink" data-nav="gallery" href="gallery.html">Gallery</a></li>
+                <li><a class="navlink" data-nav="merch" href="merch.html">Merch</a></li>
+                <li><a class="navlink" data-nav="news" href="news.html">News</a></li>
+                <li><a class="navlink" data-nav="contact" href="contact.html">Contact</a></li>
+            </ul>
+            <div class="nav-right">
+                <span class="admin-badge" id="adminBadge" style="display:none;"><i class="fas fa-shield-alt"></i> Admin</span>
+                <button class="logout-btn" id="logoutBtn" onclick="logout()">Logout</button>
+                <a class="admin-button" id="adminLoginBtn" href="admin.html">Admin</a>
+                <div class="mobile-toggle" id="mobileToggle"><i class="fas fa-bars"></i></div>
+            </div>
+        </div>
+    </nav>
+    <main class="page-main" style="padding-top: calc(var(--nav-h) + 0.5rem);">
+<section id="tour" class="section">
+        <div class="section-head">
+            <span class="section-kicker">Catch A Show</span>
+            <h2 class="section-title">Tour &amp; Shows</h2>
+            <p class="section-sub">Live dates and appearances. New shows added regularly.</p>
+        </div>
+        <div class="tour-list" id="tourList">
+            <!-- Shows rendered here -->
+        </div>
+
+        <div id="myTicketsWrap" style="display:none; margin-top:3.2rem;">
+            <h3 class="mytix-title"><i class="fas fa-ticket"></i> My Tickets</h3>
+            <p class="mytix-sub">Saved on this device — pull up the QR at the door.</p>
+            <div class="mytix-grid" id="myTicketsGrid"></div>
+        </div>
+    </section>
+    </main>
+    <div class="ticket-modal" id="ticketModal">
+        <div class="ticket-box">
+            <button class="tm-close" onclick="closeTicketModal()" aria-label="Close">&times;</button>
+            <div id="ticketBuyView">
+                <h3><i class="fas fa-ticket"></i> Get Tickets</h3>
+                <div class="tm-event" id="tmEventInfo"></div>
+                <div class="tm-price" id="tmPrice">$0 CAD</div>
+                <input type="text" class="tm-input" id="tmName" placeholder="Full name (printed on ticket)" aria-label="Full name printed on the ticket">
+                <input type="email" class="tm-input" id="tmEmail" placeholder="Email (optional — for your records)" aria-label="Email address, optional">
+                <div id="tmPayContainer"></div>
+                <button class="paypal-cancel-btn" onclick="closeTicketModal()">Cancel</button>
+            </div>
+            <div id="ticketResultView" style="display:none;"></div>
+        </div>
+    </div>
+
+    
+    <div class="floating-music" id="floatingPlayer">
+        <div style="display:flex; align-items:center; gap:1rem;">
+            <button class="play-btn" id="globalPlayBtn" style="width:42px; height:42px;"><i class="fas fa-play"></i></button>
+            <div style="flex:1;">
+                <div style="display:flex; align-items:center; gap:0.6rem;">
+                    <div class="eq"><span></span><span></span><span></span><span></span></div>
+                    <div id="currentSongTitle" style="font-size:0.9rem; font-weight:600;">No song playing</div>
+                </div>
+                <div class="progress-bar" id="globalProgress" style="margin-top:0.5rem;"><div class="progress-fill" id="globalProgressFill"></div></div>
+            </div>
+        </div>
+    </div>
+    <button id="backToTop" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Back to top"><i class="fas fa-arrow-up"></i></button>
+    <div class="cookie-banner" id="cookieBanner">
+        <div class="cookie-text"><strong><i class="fas fa-cookie-bite"></i> Cookies</strong>We use cookies for analytics and to show ads that help keep the music free. You can accept or reject — your choice is remembered.</div>
+        <div class="cookie-actions"><button class="cookie-btn reject" onclick="setCookieConsent('rejected')">Reject</button><button class="cookie-btn accept" onclick="setCookieConsent('accepted')">Accept</button></div>
+    </div>
+    <footer class="footer">
+        <a href="index.html" class="logo" style="font-size:1.5rem; justify-content:center;"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+        <div class="footer-nav">
+            <a href="about.html">About</a><a href="music.html">Music</a><a href="podcast.html">Podcast</a><a href="videos.html">Videos</a><a href="tour.html">Tour</a><a href="gallery.html">Gallery</a><a href="merch.html">Merch</a><a href="news.html">News</a><a href="contact.html">Contact</a><a href="admin.html">Admin</a><a href="#" onclick="openCookieSettings(); return false;">Cookie Settings</a>
+        </div>
+        <p class="fine">&copy; 2024 p2k-music.ca — All rights reserved. Professional Artist Portfolio &amp; Music Platform.</p>
+    </footer>
+
+    <script src="assets/app.js"></script>
+</body>
+</html>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Videos — p2k-music.ca</title>
+    <meta name="description" content="Music videos, studio sessions and visualizers from P2K.">
+    <meta name="theme-color" content="#05060d">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%2305060d'/%3E%3Ccircle cx='32' cy='32' r='24' fill='none' stroke='%2300d4ff' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='%23ff2d95' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%23ffc439'/%3E%3C/svg%3E">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="p2k-music.ca">
+    <meta property="og:title" content="Videos — P2K">
+    <meta property="og:description" content="Music videos, studio sessions and visualizers from P2K.">
+    <meta property="og:url" content="https://p2k-music.ca/videos.html">
+    <meta property="og:image" content="https://p2k-music.ca/background.jpg">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-2580922665149434" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body data-page="videos">
+    <div id="loader"><div class="loader-logo">p2k-music</div><div class="loader-bar"><span></span></div><div class="loader-sub">Loading the sound</div></div>
+    <div id="scrollProgress"></div>
+    <div id="cursorGlow"></div>
+    <canvas id="fxParticles"></canvas>
+    <canvas id="pageViz" class="page-viz"></canvas>
+    <div class="custom-bg" id="customBg" style="background-image: url('background.jpg');"></div>
+    <nav class="navbar" id="navbar">
+        <div class="nav-container">
+            <a href="index.html" class="logo"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+            <ul class="nav-links" id="navLinks">
+                <li><a class="navlink" data-nav="home" href="index.html">Home</a></li>
+                <li><a class="navlink" data-nav="about" href="about.html">About</a></li>
+                <li><a class="navlink" data-nav="music" href="music.html">Music</a></li>
+                <li><a class="navlink" data-nav="podcast" href="podcast.html">Podcast</a></li>
+                <li><a class="navlink" data-nav="videos" href="videos.html">Videos</a></li>
+                <li><a class="navlink" data-nav="tour" href="tour.html">Tour</a></li>
+                <li><a class="navlink" data-nav="gallery" href="gallery.html">Gallery</a></li>
+                <li><a class="navlink" data-nav="merch" href="merch.html">Merch</a></li>
+                <li><a class="navlink" data-nav="news" href="news.html">News</a></li>
+                <li><a class="navlink" data-nav="contact" href="contact.html">Contact</a></li>
+            </ul>
+            <div class="nav-right">
+                <span class="admin-badge" id="adminBadge" style="display:none;"><i class="fas fa-shield-alt"></i> Admin</span>
+                <button class="logout-btn" id="logoutBtn" onclick="logout()">Logout</button>
+                <a class="admin-button" id="adminLoginBtn" href="admin.html">Admin</a>
+                <div class="mobile-toggle" id="mobileToggle"><i class="fas fa-bars"></i></div>
+            </div>
+        </div>
+    </nav>
+    <main class="page-main" style="padding-top: calc(var(--nav-h) + 0.5rem);">
+<section id="videos" class="section">
+        <div class="section-head">
+            <span class="section-kicker">Watch</span>
+            <h2 class="section-title">Videos</h2>
+            <p class="section-sub">Music videos, studio sessions and visualizers.</p>
+        </div>
+        <div class="video-grid">
+            <div class="video-card reveal" role="button" tabindex="0" aria-label="Play DEEZY ME! — Official Visualizer" onclick="videoSoon('DEEZY ME! — Official Visualizer')">
+                <div class="video-thumb" style="background-image:url('https://images.unsplash.com/photo-1470225620780-dba8ba36b745?w=640&h=360&fit=crop')"></div>
+                <span class="video-badge">Visualizer</span>
+                <div class="video-play"><i class="fas fa-play"></i></div>
+                <div class="video-info"><h4>DEEZY ME!</h4><span>Official Visualizer</span></div>
+            </div>
+            <div class="video-card reveal d1" role="button" tabindex="0" aria-label="Play Behind The Beat — Studio Session" onclick="videoSoon('Studio Session — Behind The Beat')">
+                <div class="video-thumb" style="background-image:url('https://images.unsplash.com/photo-1598488035139-bdbb2231ce04?w=640&h=360&fit=crop')"></div>
+                <span class="video-badge">Studio</span>
+                <div class="video-play"><i class="fas fa-play"></i></div>
+                <div class="video-info"><h4>Behind The Beat</h4><span>Studio Session</span></div>
+            </div>
+            <div class="video-card reveal d2" role="button" tabindex="0" aria-label="Play Blueline Hotline — Live Set" onclick="videoSoon('Blueline Hotline — Live Set')">
+                <div class="video-thumb" style="background-image:url('https://images.unsplash.com/photo-1516450360452-9312f5e86fc7?w=640&h=360&fit=crop')"></div>
+                <span class="video-badge">Live</span>
+                <div class="video-play"><i class="fas fa-play"></i></div>
+                <div class="video-info"><h4>Blueline Hotline</h4><span>Live Set</span></div>
+            </div>
+        </div>
+    </section>
+    </main>
+
+    <div class="floating-music" id="floatingPlayer">
+        <div style="display:flex; align-items:center; gap:1rem;">
+            <button class="play-btn" id="globalPlayBtn" style="width:42px; height:42px;"><i class="fas fa-play"></i></button>
+            <div style="flex:1;">
+                <div style="display:flex; align-items:center; gap:0.6rem;">
+                    <div class="eq"><span></span><span></span><span></span><span></span></div>
+                    <div id="currentSongTitle" style="font-size:0.9rem; font-weight:600;">No song playing</div>
+                </div>
+                <div class="progress-bar" id="globalProgress" style="margin-top:0.5rem;"><div class="progress-fill" id="globalProgressFill"></div></div>
+            </div>
+        </div>
+    </div>
+    <button id="backToTop" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Back to top"><i class="fas fa-arrow-up"></i></button>
+    <div class="cookie-banner" id="cookieBanner">
+        <div class="cookie-text"><strong><i class="fas fa-cookie-bite"></i> Cookies</strong>We use cookies for analytics and to show ads that help keep the music free. You can accept or reject — your choice is remembered.</div>
+        <div class="cookie-actions"><button class="cookie-btn reject" onclick="setCookieConsent('rejected')">Reject</button><button class="cookie-btn accept" onclick="setCookieConsent('accepted')">Accept</button></div>
+    </div>
+    <footer class="footer">
+        <a href="index.html" class="logo" style="font-size:1.5rem; justify-content:center;"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+        <div class="footer-nav">
+            <a href="about.html">About</a><a href="music.html">Music</a><a href="podcast.html">Podcast</a><a href="videos.html">Videos</a><a href="tour.html">Tour</a><a href="gallery.html">Gallery</a><a href="merch.html">Merch</a><a href="news.html">News</a><a href="contact.html">Contact</a><a href="admin.html">Admin</a><a href="#" onclick="openCookieSettings(); return false;">Cookie Settings</a>
+        </div>
+        <p class="fine">&copy; 2024 p2k-music.ca — All rights reserved. Professional Artist Portfolio &amp; Music Platform.</p>
+    </footer>
+
+    <script src="assets/app.js"></script>
+</body>
+</html>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Contact — p2k-music.ca</title>
+    <meta name="description" content="Book P2K, follow across platforms, read the license and leave a comment.">
+    <meta name="theme-color" content="#05060d">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%2305060d'/%3E%3Ccircle cx='32' cy='32' r='24' fill='none' stroke='%2300d4ff' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='%23ff2d95' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%23ffc439'/%3E%3C/svg%3E">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="p2k-music.ca">
+    <meta property="og:title" content="Contact & Booking — P2K">
+    <meta property="og:description" content="Book P2K, follow across platforms, read the license and leave a comment.">
+    <meta property="og:url" content="https://p2k-music.ca/contact.html">
+    <meta property="og:image" content="https://p2k-music.ca/background.jpg">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-2580922665149434" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body data-page="contact">
+    <div id="loader"><div class="loader-logo">p2k-music</div><div class="loader-bar"><span></span></div><div class="loader-sub">Loading the sound</div></div>
+    <div id="scrollProgress"></div>
+    <div id="cursorGlow"></div>
+    <canvas id="fxParticles"></canvas>
+    <canvas id="pageViz" class="page-viz"></canvas>
+    <div class="custom-bg" id="customBg" style="background-image: url('background.jpg');"></div>
+    <nav class="navbar" id="navbar">
+        <div class="nav-container">
+            <a href="index.html" class="logo"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+            <ul class="nav-links" id="navLinks">
+                <li><a class="navlink" data-nav="home" href="index.html">Home</a></li>
+                <li><a class="navlink" data-nav="about" href="about.html">About</a></li>
+                <li><a class="navlink" data-nav="music" href="music.html">Music</a></li>
+                <li><a class="navlink" data-nav="podcast" href="podcast.html">Podcast</a></li>
+                <li><a class="navlink" data-nav="videos" href="videos.html">Videos</a></li>
+                <li><a class="navlink" data-nav="tour" href="tour.html">Tour</a></li>
+                <li><a class="navlink" data-nav="gallery" href="gallery.html">Gallery</a></li>
+                <li><a class="navlink" data-nav="merch" href="merch.html">Merch</a></li>
+                <li><a class="navlink" data-nav="news" href="news.html">News</a></li>
+                <li><a class="navlink" data-nav="contact" href="contact.html">Contact</a></li>
+            </ul>
+            <div class="nav-right">
+                <span class="admin-badge" id="adminBadge" style="display:none;"><i class="fas fa-shield-alt"></i> Admin</span>
+                <button class="logout-btn" id="logoutBtn" onclick="logout()">Logout</button>
+                <a class="admin-button" id="adminLoginBtn" href="admin.html">Admin</a>
+                <div class="mobile-toggle" id="mobileToggle"><i class="fas fa-bars"></i></div>
+            </div>
+        </div>
+    </nav>
+    <main class="page-main" style="padding-top: calc(var(--nav-h) + 0.5rem);">
+<section id="contact" class="section">
+        <div class="section-head">
+            <span class="section-kicker">Get In Touch</span>
+            <h2 class="section-title">Connect With P2K</h2>
+        </div>
+        <div class="contact-grid">
+            <div class="contact-card reveal">
+                <h3><i class="fas fa-satellite-dish"></i> Follow The Movement</h3>
+                <p>Follow p2k-music.ca across every platform for the latest releases, behind-the-scenes content and exclusive drops straight from the studio.</p>
+                <div class="social-links">
+                    <a href="#" title="Spotify"><i class="fab fa-spotify"></i></a>
+                    <a href="#" title="Apple Music"><i class="fab fa-apple"></i></a>
+                    <a href="#" title="YouTube"><i class="fab fa-youtube"></i></a>
+                    <a href="#" title="SoundCloud"><i class="fab fa-soundcloud"></i></a>
+                    <a href="#" title="Instagram"><i class="fab fa-instagram"></i></a>
+                    <a href="#" title="Twitter"><i class="fab fa-twitter"></i></a>
+                </div>
+            </div>
+            <div class="contact-card reveal d1">
+                <h3><i class="fas fa-calendar-check"></i> Booking &amp; Enquiries</h3>
+                <p>Shows, features, remixes or licensing? Send a message and P2K will get back to you.</p>
+                <form class="booking-form" onsubmit="handleBooking(event)">
+                    <input type="text" id="bookName" placeholder="Your name" aria-label="Your name" required>
+                    <input type="email" id="bookEmail" placeholder="Email address" aria-label="Email address" required>
+                    <select id="bookType" aria-label="Enquiry type">
+                        <option value="Booking">Booking / Show</option>
+                        <option value="Feature">Feature / Collab</option>
+                        <option value="Licensing">Licensing</option>
+                        <option value="Other">Other</option>
+                    </select>
+                    <textarea id="bookMsg" placeholder="Tell P2K what you're planning..." aria-label="Your message" required></textarea>
+                    <button type="submit" class="cta-button" style="width:100%; justify-content:center;"><i class="fas fa-paper-plane"></i> Send Message</button>
+                </form>
+            </div>
+        </div>
+    </section><section id="comments" class="section">
+        <div class="section-head">
+            <span class="section-kicker">Join The Conversation</span>
+            <h2 class="section-title">Community Comments</h2>
+        </div>
+        <div class="comments-section reveal">
+            <form onsubmit="addComment(event)">
+                <div class="comment-input-group">
+                    <label for="commentName"><i class="fas fa-user"></i> Your Name (Optional)</label>
+                    <input type="text" id="commentName" placeholder="Enter your name or leave blank for Anonymous">
+                </div>
+                <div class="comment-input-group">
+                    <label for="commentText"><i class="fas fa-comment"></i> Leave a Comment</label>
+                    <textarea id="commentText" placeholder="Share your thoughts about the music..." required></textarea>
+                </div>
+                <button type="submit" class="comment-submit"><i class="fas fa-paper-plane"></i> Post Comment</button>
+            </form>
+
+            <h3 style="margin-top: 2rem; margin-bottom: 1rem; color: var(--cyan); font-family: 'Orbitron', monospace;">Recent Comments</h3>
+            <ul class="comments-list" id="commentsList">
+                <li class="no-comments">No comments yet. Be the first to comment!</li>
+            </ul>
+        </div>
+    </section><section id="license" class="section">
+        <div class="section-head">
+            <span class="section-kicker">The Fine Print</span>
+            <h2 class="section-title">License &amp; Legal</h2>
+        </div>
+        <div class="license-section reveal">
+            <h3>Rights &amp; Usage</h3>
+            <div class="license-content">
+                <p><strong>p2k-music.ca — Music &amp; Content</strong></p>
+                <p>All music, recordings, artwork and content on this site are the property of P2K. <strong>All rights reserved.</strong> Streaming previews here is free; a purchased track is licensed for personal listening only.</p>
+                <p><strong>You may:</strong> Stream previews • Play &amp; keep tracks you've purchased • Share links to this site</p>
+                <p><strong>You may not:</strong> Redistribute, resell, remix or sample any track without written permission from P2K</p>
+                <p>For licensing, sync, remix or sampling requests, use the booking form above — commercial licensing is available.</p>
+                <p style="margin-top: 1rem; opacity: 0.7; font-size: 0.9rem;">© 2024 p2k-music.ca. All rights reserved.</p>
+                <span class="license-badge"><i class="fas fa-certificate"></i> All Rights Reserved</span>
+            </div>
+        </div>
+    </section>
+    </main>
+
+    <div class="floating-music" id="floatingPlayer">
+        <div style="display:flex; align-items:center; gap:1rem;">
+            <button class="play-btn" id="globalPlayBtn" style="width:42px; height:42px;"><i class="fas fa-play"></i></button>
+            <div style="flex:1;">
+                <div style="display:flex; align-items:center; gap:0.6rem;">
+                    <div class="eq"><span></span><span></span><span></span><span></span></div>
+                    <div id="currentSongTitle" style="font-size:0.9rem; font-weight:600;">No song playing</div>
+                </div>
+                <div class="progress-bar" id="globalProgress" style="margin-top:0.5rem;"><div class="progress-fill" id="globalProgressFill"></div></div>
+            </div>
+        </div>
+    </div>
+    <button id="backToTop" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Back to top"><i class="fas fa-arrow-up"></i></button>
+    <div class="cookie-banner" id="cookieBanner">
+        <div class="cookie-text"><strong><i class="fas fa-cookie-bite"></i> Cookies</strong>We use cookies for analytics and to show ads that help keep the music free. You can accept or reject — your choice is remembered.</div>
+        <div class="cookie-actions"><button class="cookie-btn reject" onclick="setCookieConsent('rejected')">Reject</button><button class="cookie-btn accept" onclick="setCookieConsent('accepted')">Accept</button></div>
+    </div>
+    <footer class="footer">
+        <a href="index.html" class="logo" style="font-size:1.5rem; justify-content:center;"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+        <div class="footer-nav">
+            <a href="about.html">About</a><a href="music.html">Music</a><a href="podcast.html">Podcast</a><a href="videos.html">Videos</a><a href="tour.html">Tour</a><a href="gallery.html">Gallery</a><a href="merch.html">Merch</a><a href="news.html">News</a><a href="contact.html">Contact</a><a href="admin.html">Admin</a><a href="#" onclick="openCookieSettings(); return false;">Cookie Settings</a>
+        </div>
+        <p class="fine">&copy; 2024 p2k-music.ca — All rights reserved. Professional Artist Portfolio &amp; Music Platform.</p>
+    </footer>
+
+    <script src="assets/app.js"></script>
+</body>
+</html>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin — p2k-music.ca</title>
+    <meta name="description" content="Owner dashboard for p2k-music.ca.">
+    <meta name="theme-color" content="#05060d">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%2305060d'/%3E%3Ccircle cx='32' cy='32' r='24' fill='none' stroke='%2300d4ff' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='%23ff2d95' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%23ffc439'/%3E%3C/svg%3E">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="p2k-music.ca">
+    <meta property="og:title" content="Admin — p2k-music.ca">
+    <meta property="og:description" content="Owner dashboard for p2k-music.ca.">
+    <meta property="og:url" content="https://p2k-music.ca/admin.html">
+    <meta property="og:image" content="https://p2k-music.ca/background.jpg">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-2580922665149434" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body data-page="admin">
+    <div id="loader"><div class="loader-logo">p2k-music</div><div class="loader-bar"><span></span></div><div class="loader-sub">Loading the sound</div></div>
+    <div id="scrollProgress"></div>
+    <div id="cursorGlow"></div>
+    <canvas id="fxParticles"></canvas>
+    <canvas id="pageViz" class="page-viz"></canvas>
+    <div class="custom-bg" id="customBg" style="background-image: url('background.jpg');"></div>
+    <nav class="navbar" id="navbar">
+        <div class="nav-container">
+            <a href="index.html" class="logo"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+            <ul class="nav-links" id="navLinks">
+                <li><a class="navlink" data-nav="home" href="index.html">Home</a></li>
+                <li><a class="navlink" data-nav="about" href="about.html">About</a></li>
+                <li><a class="navlink" data-nav="music" href="music.html">Music</a></li>
+                <li><a class="navlink" data-nav="podcast" href="podcast.html">Podcast</a></li>
+                <li><a class="navlink" data-nav="videos" href="videos.html">Videos</a></li>
+                <li><a class="navlink" data-nav="tour" href="tour.html">Tour</a></li>
+                <li><a class="navlink" data-nav="gallery" href="gallery.html">Gallery</a></li>
+                <li><a class="navlink" data-nav="merch" href="merch.html">Merch</a></li>
+                <li><a class="navlink" data-nav="news" href="news.html">News</a></li>
+                <li><a class="navlink" data-nav="contact" href="contact.html">Contact</a></li>
+            </ul>
+            <div class="nav-right">
+                <span class="admin-badge" id="adminBadge" style="display:none;"><i class="fas fa-shield-alt"></i> Admin</span>
+                <button class="logout-btn" id="logoutBtn" onclick="logout()">Logout</button>
+                <a class="admin-button" id="adminLoginBtn" href="admin.html">Admin</a>
+                <div class="mobile-toggle" id="mobileToggle"><i class="fas fa-bars"></i></div>
+            </div>
+        </div>
+    </nav>
+        <div class="admin-login-modal" id="adminLoginModal">
+        <div class="login-box">
+            <h2>Admin Access</h2>
+            <div class="login-error" id="loginError"></div>
+            <!-- Step 1: email + password -->
+            <form id="loginStep1" onsubmit="handleAdminLogin(event)">
+                <input type="email" class="login-input" id="adminEmail" placeholder="Admin email" autocomplete="username" required>
+                <input type="password" class="login-input" id="adminPassword" placeholder="Password" autocomplete="current-password" required>
+                <button type="submit" class="login-btn" id="loginContinueBtn">Continue</button>
+            </form>
+            <!-- Step 2: emailed one-time code -->
+            <form id="loginStep2" onsubmit="handleAdminVerify(event)" style="display:none;">
+                <p id="loginSentMsg" style="color:var(--muted); font-size:0.9rem; margin-bottom:0.9rem;"></p>
+                <input type="text" class="login-input" id="adminCode" placeholder="6-digit code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required>
+                <button type="submit" class="login-btn">Verify &amp; Sign in</button>
+                <button type="button" class="btn" onclick="resetAdminLogin()" style="margin-top:0.6rem; width:100%;">&larr; Use a different account</button>
+            </form>
+            <button class="btn" onclick="hideAdminLogin()" style="margin-top: 1rem;">Cancel</button>
+        </div>
+    </div>
+
+    
+    <main class="page-main" style="padding-top: calc(var(--nav-h) + 0.5rem);">
+
+    <section class="page-hero" style="padding-bottom:0.5rem;">
+        <span class="eyebrow"><span class="dot"></span> Owner Area</span>
+        <h1>Admin</h1>
+        <p>Manage content, run the door, and monitor profit. Sign in with your admin email — a one-time code is sent to your inbox.</p>
+        <div style="margin-top:1.2rem;"><button class="cta-button" onclick="showAdminLogin()"><i class="fas fa-lock-open"></i> Admin Sign In</button></div>
+    </section>
+    <div id="admin-wallet">
+        <div class="wallet-header">
+            <span id="wallet-live-badge">● Paused</span>
+            Earnings Wallet
+        </div>
+
+        <div class="wallet-display">
+            <div class="wallet-balance">
+                <span id="w-dollars">0</span>
+                <span id="w-cents">00</span>
+            </div>
+
+            <div class="wallet-stats">
+                <div class="wallet-stat">
+                    <div class="wallet-stat-label">Session Earnings</div>
+                    <div class="wallet-stat-value" id="w-session">$0.00</div>
+                </div>
+                <div class="wallet-stat">
+                    <div class="wallet-stat-label">Total Paid Out</div>
+                    <div class="wallet-stat-value" id="w-paid">$0.00</div>
+                </div>
+                <div class="wallet-stat">
+                    <div class="wallet-stat-label">Listen Time</div>
+                    <div class="wallet-stat-value" id="w-time">0:00</div>
+                </div>
+            </div>
+
+            <div class="wallet-progress">
+                <div id="w-bar"></div>
+            </div>
+            <div class="wallet-progress-text">
+                <span id="w-pct">0</span>% — <span id="w-hint">$1.55 more to unlock</span>
+            </div>
+        </div>
+
+        <div id="w-success"></div>
+        <div id="w-error"></div>
+
+        <div class="wallet-controls">
+            <input type="number" id="w-amount" placeholder="Enter amount (min $1.55)" aria-label="Withdrawal amount in CAD" step="0.01">
+            <button class="wallet-btn" onclick="setWAll()">All</button>
+            <button class="wallet-btn" onclick="sendWithdraw()">Withdraw</button>
+        </div>
+    </div>
+
+    <section id="admin" class="section">
+        <div class="section-head">
+            <span class="section-kicker">Owner Only</span>
+            <h2 class="section-title">Content Management</h2>
+        </div>
+
+        <div class="admin-panel" id="adminPanel">
+            <h3 style="margin-bottom: 2rem; color: var(--cyan);"><i class="fas fa-lock-open"></i> Admin Controls</h3>
+
+            <!-- Drag & Drop Upload Zones -->
+            <div class="drop-zone" id="songDropZone">
+                <i class="fas fa-music"></i>
+                <h4>Drop Songs Here or Click to Upload</h4>
+                <p>Drag &amp; drop MP3, WAV, OGG, or MP4 files</p>
+                <input type="file" id="songUpload" class="file-input" accept="audio/*,video/mp4" multiple>
+                <div class="upload-progress" id="songUploadProgress">
+                    <div class="progress-bar"><div class="progress-fill" id="songProgressFill"></div></div>
+                    <div class="upload-progress-text" id="songProgressText"></div>
+                </div>
+            </div>
+
+            <div style="display: flex; gap: 1rem; flex-wrap: wrap;">
+                <div class="drop-zone" id="imageDropZone" style="flex:1; min-width:250px;">
+                    <i class="fas fa-image"></i>
+                    <h4>Drop Images Here</h4>
+                    <p>JPG, PNG, GIF files</p>
+                    <input type="file" id="imageUpload" class="file-input" accept="image/*" multiple>
+                </div>
+
+                <div class="drop-zone" id="bgDropZone" style="flex:1; min-width:250px;">
+                    <i class="fas fa-palette"></i>
+                    <h4>Drop Background Image</h4>
+                    <p>Set a custom background</p>
+                    <input type="file" id="bgUpload" class="file-input" accept="image/*">
+                </div>
+            </div>
+
+            <!-- Post News Update -->
+            <div class="news-form" style="margin-top:1.5rem;">
+                <h4 style="color:var(--cyan); margin-bottom:1rem;"><i class="fas fa-bullhorn"></i> Post News Update</h4>
+                <input type="text" id="newsTitle" placeholder="Title (e.g. New Song Dropping Friday!)">
+                <textarea id="newsBody" placeholder="Write your announcement for fans..."></textarea>
+                <button class="btn" onclick="postNews()" style="width:100%;"><i class="fas fa-paper-plane"></i> Post Update</button>
+            </div>
+
+            <!-- Announce a Show / Event -->
+            <div class="news-form" style="margin-top:1.5rem;">
+                <h4 style="color:var(--cyan); margin-bottom:1rem;"><i class="fas fa-ticket"></i> Announce a Show</h4>
+                <input type="text" id="evTitle" placeholder="Show title (e.g. P2K Live at The Vault)">
+                <div style="display:flex; gap:0.6rem; flex-wrap:wrap;">
+                    <input type="date" id="evDate" style="flex:1; min-width:150px; color-scheme: dark;">
+                    <input type="text" id="evVenue" placeholder="Venue" style="flex:1; min-width:150px;">
+                </div>
+                <div style="display:flex; gap:0.6rem; flex-wrap:wrap;">
+                    <input type="text" id="evCity" placeholder="City (e.g. Toronto, ON)" style="flex:2; min-width:150px;">
+                    <input type="number" id="evPrice" placeholder="Price CAD (0 = free)" step="0.01" min="0" style="flex:1; min-width:120px;">
+                    <input type="number" id="evCap" placeholder="Capacity" min="1" style="flex:1; min-width:110px;">
+                </div>
+                <button class="btn" onclick="announceEvent()" style="width:100%;"><i class="fas fa-bullhorn"></i> Announce &amp; Open Ticket Sales</button>
+            </div>
+
+            <!-- New Podcast Episode -->
+            <div class="news-form" style="margin-top:1.5rem;">
+                <h4 style="color:var(--cyan); margin-bottom:1rem;"><i class="fas fa-podcast"></i> New Podcast Episode</h4>
+                <input type="text" id="epTitle" placeholder="Episode title">
+                <div style="display:flex; gap:0.6rem; flex-wrap:wrap;">
+                    <input type="text" id="epGuest" placeholder="Guest(s)" style="flex:1; min-width:150px;">
+                    <input type="date" id="epDate" style="flex:1; min-width:150px; color-scheme:dark;">
+                </div>
+                <textarea id="epDesc" placeholder="Episode description..."></textarea>
+                <input type="text" id="epAudioUrl" placeholder="Audio URL (paste a link) — or upload a file below:">
+                <input type="file" id="epUpload" accept="audio/*" style="width:100%; margin-bottom:0.8rem; color:var(--muted); font-size:0.85rem;">
+                <button class="btn" onclick="addEpisode()" style="width:100%;"><i class="fas fa-plus"></i> Publish Episode</button>
+            </div>
+
+            <!-- Invite a Guest to the show -->
+            <div class="news-form" style="margin-top:1.5rem;">
+                <h4 style="color:var(--cyan); margin-bottom:1rem;"><i class="fas fa-user-plus"></i> Invite a Guest</h4>
+                <div style="display:flex; gap:0.6rem; flex-wrap:wrap;">
+                    <input type="text" id="invName" placeholder="Guest name" style="flex:1; min-width:150px;">
+                    <input type="date" id="invDate" style="flex:1; min-width:150px; color-scheme:dark;">
+                </div>
+                <input type="text" id="invShow" placeholder="Show / episode topic (optional)">
+                <button class="btn" onclick="generateInvite()" style="width:100%;"><i class="fas fa-envelope-open-text"></i> Generate Invite</button>
+                <div id="inviteResult"></div>
+            </div>
+
+            <!-- Guest applications + sent invites -->
+            <div class="news-form" style="margin-top:1.5rem;">
+                <h4 style="color:var(--cyan); margin-bottom:1rem;"><i class="fas fa-inbox"></i> Guest Applications &amp; Invites</h4>
+                <div id="guestAdminList"><div class="no-comments">No applications or invites yet.</div></div>
+            </div>
+
+            <div style="text-align: center;">
+                <button class="btn" onclick="resetToDefault()">
+                    <i class="fas fa-undo"></i> Reset Background
+                </button>
+                <button class="btn btn-danger" onclick="clearAllData()">
+                    <i class="fas fa-trash"></i> Clear All Content
+                </button>
+            </div>
+        </div>
+    </section><section id="checkin" class="section" style="display:none;">
+        <div class="section-head">
+            <span class="section-kicker">Door Mode · Admin</span>
+            <h2 class="section-title">Scan &amp; Check-In</h2>
+            <p class="section-sub">Scan a ticket QR with your camera, or type the code, to validate entry at the door.</p>
+        </div>
+        <div class="checkin-wrap">
+            <div class="checkin-col">
+                <div class="scanner" id="scannerBox">
+                    <video id="scanVideo" playsinline muted></video>
+                    <div class="scan-frame"></div>
+                    <div class="scan-idle" id="scanIdle"><i class="fas fa-camera"></i><p>Camera off</p></div>
+                </div>
+                <button class="btn" id="scanToggleBtn" onclick="toggleScanner()" style="width:100%; margin:0;"><i class="fas fa-camera"></i> Start Camera</button>
+                <div class="manual-entry">
+                    <input type="text" id="manualCode" class="tm-input" placeholder="Ticket code (P2K-XXX-XXXXXX)" aria-label="Ticket code" style="margin:0;">
+                    <button class="btn" onclick="checkInManual()" style="margin:0;"><i class="fas fa-magnifying-glass"></i> Check</button>
+                </div>
+                <p class="checkin-note"><i class="fas fa-circle-info"></i> Validates tickets stored on this device. Cross-device door checks arrive with the backend (server ticket lookup).</p>
+            </div>
+            <div class="checkin-col">
+                <div class="checkin-result" id="checkinResult">
+                    <div class="ci-placeholder"><i class="fas fa-qrcode"></i><p>Awaiting a ticket…</p></div>
+                </div>
+                <div class="checkin-stats"><i class="fas fa-user-check"></i> Checked in tonight: <b id="ciCount">0</b></div>
+                <div class="checkin-log" id="checkinLog"></div>
+            </div>
+        </div>
+    </section><section id="profit" class="section" style="display:none;">
+        <div class="section-head">
+            <span class="section-kicker">Owner · Money</span>
+            <h2 class="section-title">Revenue &amp; Profit</h2>
+            <p class="section-sub">Every sale and every minute of listening on the site, banked and monitored in one place.</p>
+        </div>
+
+        <div class="profit-hero">
+            <div class="profit-total-label">Total Profit Tracked</div>
+            <div class="profit-total" id="profitTotal">$0.00</div>
+            <div class="profit-total-sub"><span id="profitCount">0</span> transactions · <span id="profitToday">$0.00</span> today</div>
+        </div>
+
+        <div class="profit-sources" id="profitSources"></div>
+
+        <div class="profit-grid2">
+            <div class="profit-panel">
+                <h4><i class="fas fa-chart-simple"></i> By Source</h4>
+                <div class="profit-chart" id="profitChart"></div>
+            </div>
+            <div class="profit-panel">
+                <h4><i class="fas fa-plus-circle"></i> Record Income</h4>
+                <p class="profit-note">Log ad payouts, bookings or cash sales — anything not auto-tracked.</p>
+                <select id="incSource" class="tm-input">
+                    <option value="ad">Ad revenue (AdSense)</option>
+                    <option value="merch">Merch</option>
+                    <option value="ticket">Tickets</option>
+                    <option value="music">Music</option>
+                    <option value="other">Other / Booking</option>
+                </select>
+                <input type="text" id="incLabel" class="tm-input" placeholder="Note (e.g. AdSense July payout)">
+                <input type="number" id="incAmount" class="tm-input" placeholder="Amount CAD" step="0.01" min="0">
+                <button class="btn" onclick="recordIncome()" style="width:100%;"><i class="fas fa-check"></i> Add to Profit</button>
+            </div>
+        </div>
+
+        <div class="profit-panel" style="margin-top:1.5rem;">
+            <h4><i class="fas fa-receipt"></i> Recent Transactions</h4>
+            <div class="profit-ledger" id="profitLedger"></div>
+        </div>
+    </section>
+    </main>
+
+    <div class="floating-music" id="floatingPlayer">
+        <div style="display:flex; align-items:center; gap:1rem;">
+            <button class="play-btn" id="globalPlayBtn" style="width:42px; height:42px;"><i class="fas fa-play"></i></button>
+            <div style="flex:1;">
+                <div style="display:flex; align-items:center; gap:0.6rem;">
+                    <div class="eq"><span></span><span></span><span></span><span></span></div>
+                    <div id="currentSongTitle" style="font-size:0.9rem; font-weight:600;">No song playing</div>
+                </div>
+                <div class="progress-bar" id="globalProgress" style="margin-top:0.5rem;"><div class="progress-fill" id="globalProgressFill"></div></div>
+            </div>
+        </div>
+    </div>
+    <button id="backToTop" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Back to top"><i class="fas fa-arrow-up"></i></button>
+    <div class="cookie-banner" id="cookieBanner">
+        <div class="cookie-text"><strong><i class="fas fa-cookie-bite"></i> Cookies</strong>We use cookies for analytics and to show ads that help keep the music free. You can accept or reject — your choice is remembered.</div>
+        <div class="cookie-actions"><button class="cookie-btn reject" onclick="setCookieConsent('rejected')">Reject</button><button class="cookie-btn accept" onclick="setCookieConsent('accepted')">Accept</button></div>
+    </div>
+    <footer class="footer">
+        <a href="index.html" class="logo" style="font-size:1.5rem; justify-content:center;"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+        <div class="footer-nav">
+            <a href="about.html">About</a><a href="music.html">Music</a><a href="podcast.html">Podcast</a><a href="videos.html">Videos</a><a href="tour.html">Tour</a><a href="gallery.html">Gallery</a><a href="merch.html">Merch</a><a href="news.html">News</a><a href="contact.html">Contact</a><a href="admin.html">Admin</a><a href="#" onclick="openCookieSettings(); return false;">Cookie Settings</a>
+        </div>
+        <p class="fine">&copy; 2024 p2k-music.ca — All rights reserved. Professional Artist Portfolio &amp; Music Platform.</p>
+    </footer>
+
+    <script src="assets/app.js"></script>
+</body>
+</html>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Home — p2k-music.ca</title>
+    <meta name="description" content="p2k-music.ca — official home of P2K. Stream previews, buy tracks, catch tour dates, and grab merch.">
+    <meta name="theme-color" content="#05060d">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%2305060d'/%3E%3Ccircle cx='32' cy='32' r='24' fill='none' stroke='%2300d4ff' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='%23ff2d95' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%23ffc439'/%3E%3C/svg%3E">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="p2k-music.ca">
+    <meta property="og:title" content="P2K — Official Artist Website">
+    <meta property="og:description" content="p2k-music.ca — official home of P2K. Stream previews, buy tracks, catch tour dates, and grab merch.">
+    <meta property="og:url" content="https://p2k-music.ca/">
+    <meta property="og:image" content="https://p2k-music.ca/background.jpg">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-2580922665149434" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body data-page="home">
+    <div id="loader"><div class="loader-logo">p2k-music</div><div class="loader-bar"><span></span></div><div class="loader-sub">Loading the sound</div></div>
+    <div id="scrollProgress"></div>
+    <div id="cursorGlow"></div>
+    <canvas id="fxParticles"></canvas>
+    <canvas id="pageViz" class="page-viz"></canvas>
+    <div class="custom-bg" id="customBg" style="background-image: url('background.jpg');"></div>
+    <nav class="navbar" id="navbar">
+        <div class="nav-container">
+            <a href="index.html" class="logo"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+            <ul class="nav-links" id="navLinks">
+                <li><a class="navlink" data-nav="home" href="index.html">Home</a></li>
+                <li><a class="navlink" data-nav="about" href="about.html">About</a></li>
+                <li><a class="navlink" data-nav="music" href="music.html">Music</a></li>
+                <li><a class="navlink" data-nav="podcast" href="podcast.html">Podcast</a></li>
+                <li><a class="navlink" data-nav="videos" href="videos.html">Videos</a></li>
+                <li><a class="navlink" data-nav="tour" href="tour.html">Tour</a></li>
+                <li><a class="navlink" data-nav="gallery" href="gallery.html">Gallery</a></li>
+                <li><a class="navlink" data-nav="merch" href="merch.html">Merch</a></li>
+                <li><a class="navlink" data-nav="news" href="news.html">News</a></li>
+                <li><a class="navlink" data-nav="contact" href="contact.html">Contact</a></li>
+            </ul>
+            <div class="nav-right">
+                <span class="admin-badge" id="adminBadge" style="display:none;"><i class="fas fa-shield-alt"></i> Admin</span>
+                <button class="logout-btn" id="logoutBtn" onclick="logout()">Logout</button>
+                <a class="admin-button" id="adminLoginBtn" href="admin.html">Admin</a>
+                <div class="mobile-toggle" id="mobileToggle"><i class="fas fa-bars"></i></div>
+            </div>
+        </div>
+    </nav>
+    <main class="page-main">
+
+    <section class="page-hero" style="min-height:72vh; display:flex; flex-direction:column; align-items:center; justify-content:center;">
+        <span class="eyebrow"><span class="dot"></span> Official Artist Website</span>
+        <h1>P2K</h1>
+        <p>Beats, remixes &amp; experimental sound from the underground.<br><b style="color:#fff;">Stream the previews. Own the tracks.</b></p>
+        <div style="display:flex; gap:1rem; flex-wrap:wrap; justify-content:center; margin-top:1.8rem;">
+            <a href="music.html" class="cta-button"><i class="fas fa-headphones"></i> Explore Music</a>
+            <a href="tour.html" class="ghost-btn"><i class="fas fa-ticket"></i> Tour Dates</a>
+        </div>
+        <div class="hero-chips" style="display:flex; gap:0.7rem; flex-wrap:wrap; justify-content:center; margin-top:2.2rem;">
+            <span class="hero-chip"><i class="fas fa-compact-disc"></i> 53 Tracks</span>
+            <span class="hero-chip"><i class="fas fa-microphone"></i> Podcast</span>
+            <span class="hero-chip"><i class="fas fa-bag-shopping"></i> Merch</span>
+            <span class="hero-chip"><i class="fab fa-paypal"></i> Instant Buy</span>
+        </div>
+    </section>
+    <div class="marquee" aria-hidden="true">
+        <div class="marquee-track">
+            <span>Hip-Hop</span><span>Dubstep</span><span>Remix</span><span>Experimental</span><span>Beats</span><span>Underground</span><span>P2K</span>
+            <span>Hip-Hop</span><span>Dubstep</span><span>Remix</span><span>Experimental</span><span>Beats</span><span>Underground</span><span>P2K</span>
+        </div>
+    </div>
+
+        <div class="stats-band">
+        <div class="stats-grid">
+            <div class="stat-card reveal">
+                <div class="stat-num" data-count="53">0</div>
+                <div class="stat-label">Tracks Released</div>
+            </div>
+            <div class="stat-card reveal d1">
+                <div class="stat-num" data-count="24" data-suffix="K">0</div>
+                <div class="stat-label">Monthly Listeners</div>
+            </div>
+            <div class="stat-card reveal d2">
+                <div class="stat-num" data-count="37" data-suffix="+">0</div>
+                <div class="stat-label">Countries Reached</div>
+            </div>
+            <div class="stat-card reveal d3">
+                <div class="stat-num" data-count="8" data-suffix=" yrs">0</div>
+                <div class="stat-label">On The Scene</div>
+            </div>
+        </div>
+    </div>
+
+    <section id="featured" class="section featured">
+        <div class="featured-grid">
+            <div class="featured-art reveal">
+                <div class="spin-ring"></div>
+                <div class="vinyl-center"></div>
+            </div>
+            <div class="featured-info reveal d1">
+                <span class="featured-tag"><i class="fas fa-fire"></i> Latest Release</span>
+                <h3>T.H.C VOL2</h3>
+                <p>The newest drop from P2K — a deep, bass-driven cut built for late nights and loud systems. Preview it free, then own the full track.</p>
+                <div class="featured-meta">
+                    <div><b>2024</b> Released</div>
+                    <div><b>Single</b> Format</div>
+                    <div><b>$16</b> CAD</div>
+                </div>
+                <div class="featured-actions">
+                    <a class="cta-button" href="music.html"><i class="fas fa-play"></i> Play Latest</a>
+                    <a href="music.html" class="ghost-btn"><i class="fas fa-list"></i> Full Catalog</a>
+                </div>
+            </div>
+        </div>
+    </section>    <section class="section">
+        <div class="section-head"><span class="section-kicker">Explore</span><h2 class="section-title">Step Inside</h2></div>
+        <div class="songs-grid">
+            <a class="song-card" href="music.html" style="text-decoration:none;"><div class="song-title"><i class="fas fa-headphones"></i> Music</div><p style="color:var(--muted); line-height:1.5;">53 tracks — preview free, own the full version.</p></a>
+            <a class="song-card" href="podcast.html" style="text-decoration:none;"><div class="song-title"><i class="fas fa-podcast"></i> Podcast</div><p style="color:var(--muted); line-height:1.5;">Conversations &amp; guests from the underground.</p></a>
+            <a class="song-card" href="videos.html" style="text-decoration:none;"><div class="song-title"><i class="fas fa-film"></i> Videos</div><p style="color:var(--muted); line-height:1.5;">Visualizers, studio sessions &amp; live sets.</p></a>
+            <a class="song-card" href="tour.html" style="text-decoration:none;"><div class="song-title"><i class="fas fa-ticket"></i> Tour</div><p style="color:var(--muted); line-height:1.5;">Live dates — grab tickets on the spot.</p></a>
+            <a class="song-card" href="gallery.html" style="text-decoration:none;"><div class="song-title"><i class="fas fa-image"></i> Gallery</div><p style="color:var(--muted); line-height:1.5;">Photos from the studio and the stage.</p></a>
+            <a class="song-card" href="merch.html" style="text-decoration:none;"><div class="song-title"><i class="fas fa-bag-shopping"></i> Merch</div><p style="color:var(--muted); line-height:1.5;">Wear the sound — tees, hoodies &amp; vinyl.</p></a>
+        </div>
+    </section>
+
+    </main>
+
+    <div class="floating-music" id="floatingPlayer">
+        <div style="display:flex; align-items:center; gap:1rem;">
+            <button class="play-btn" id="globalPlayBtn" style="width:42px; height:42px;"><i class="fas fa-play"></i></button>
+            <div style="flex:1;">
+                <div style="display:flex; align-items:center; gap:0.6rem;">
+                    <div class="eq"><span></span><span></span><span></span><span></span></div>
+                    <div id="currentSongTitle" style="font-size:0.9rem; font-weight:600;">No song playing</div>
+                </div>
+                <div class="progress-bar" id="globalProgress" style="margin-top:0.5rem;"><div class="progress-fill" id="globalProgressFill"></div></div>
+            </div>
+        </div>
+    </div>
+    <button id="backToTop" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Back to top"><i class="fas fa-arrow-up"></i></button>
+    <div class="cookie-banner" id="cookieBanner">
+        <div class="cookie-text"><strong><i class="fas fa-cookie-bite"></i> Cookies</strong>We use cookies for analytics and to show ads that help keep the music free. You can accept or reject — your choice is remembered.</div>
+        <div class="cookie-actions"><button class="cookie-btn reject" onclick="setCookieConsent('rejected')">Reject</button><button class="cookie-btn accept" onclick="setCookieConsent('accepted')">Accept</button></div>
+    </div>
+    <footer class="footer">
+        <a href="index.html" class="logo" style="font-size:1.5rem; justify-content:center;"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+        <div class="footer-nav">
+            <a href="about.html">About</a><a href="music.html">Music</a><a href="podcast.html">Podcast</a><a href="videos.html">Videos</a><a href="tour.html">Tour</a><a href="gallery.html">Gallery</a><a href="merch.html">Merch</a><a href="news.html">News</a><a href="contact.html">Contact</a><a href="admin.html">Admin</a><a href="#" onclick="openCookieSettings(); return false;">Cookie Settings</a>
+        </div>
+        <p class="fine">&copy; 2024 p2k-music.ca — All rights reserved. Professional Artist Portfolio &amp; Music Platform.</p>
+    </footer>
+
+    <script src="assets/app.js"></script>
+</body>
+</html>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>About — p2k-music.ca</title>
+    <meta name="description" content="The story behind P2K — producer, beatmaker and remix artist from the underground.">
+    <meta name="theme-color" content="#05060d">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%2305060d'/%3E%3Ccircle cx='32' cy='32' r='24' fill='none' stroke='%2300d4ff' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='%23ff2d95' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%23ffc439'/%3E%3C/svg%3E">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="p2k-music.ca">
+    <meta property="og:title" content="About P2K">
+    <meta property="og:description" content="The story behind P2K — producer, beatmaker and remix artist from the underground.">
+    <meta property="og:url" content="https://p2k-music.ca/about.html">
+    <meta property="og:image" content="https://p2k-music.ca/background.jpg">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-2580922665149434" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body data-page="about">
+    <div id="loader"><div class="loader-logo">p2k-music</div><div class="loader-bar"><span></span></div><div class="loader-sub">Loading the sound</div></div>
+    <div id="scrollProgress"></div>
+    <div id="cursorGlow"></div>
+    <canvas id="fxParticles"></canvas>
+    <canvas id="pageViz" class="page-viz"></canvas>
+    <div class="custom-bg" id="customBg" style="background-image: url('background.jpg');"></div>
+    <nav class="navbar" id="navbar">
+        <div class="nav-container">
+            <a href="index.html" class="logo"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+            <ul class="nav-links" id="navLinks">
+                <li><a class="navlink" data-nav="home" href="index.html">Home</a></li>
+                <li><a class="navlink" data-nav="about" href="about.html">About</a></li>
+                <li><a class="navlink" data-nav="music" href="music.html">Music</a></li>
+                <li><a class="navlink" data-nav="podcast" href="podcast.html">Podcast</a></li>
+                <li><a class="navlink" data-nav="videos" href="videos.html">Videos</a></li>
+                <li><a class="navlink" data-nav="tour" href="tour.html">Tour</a></li>
+                <li><a class="navlink" data-nav="gallery" href="gallery.html">Gallery</a></li>
+                <li><a class="navlink" data-nav="merch" href="merch.html">Merch</a></li>
+                <li><a class="navlink" data-nav="news" href="news.html">News</a></li>
+                <li><a class="navlink" data-nav="contact" href="contact.html">Contact</a></li>
+            </ul>
+            <div class="nav-right">
+                <span class="admin-badge" id="adminBadge" style="display:none;"><i class="fas fa-shield-alt"></i> Admin</span>
+                <button class="logout-btn" id="logoutBtn" onclick="logout()">Logout</button>
+                <a class="admin-button" id="adminLoginBtn" href="admin.html">Admin</a>
+                <div class="mobile-toggle" id="mobileToggle"><i class="fas fa-bars"></i></div>
+            </div>
+        </div>
+    </nav>
+    <main class="page-main" style="padding-top: calc(var(--nav-h) + 0.5rem);">
+<section id="about" class="section">
+        <div class="about-grid">
+            <div class="about-photo reveal">
+                <img src="https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=700&h=875&fit=crop" alt="P2K in the studio">
+                <div class="frame-glow"></div>
+            </div>
+            <div class="about-text reveal d1">
+                <span class="section-kicker">The Artist</span>
+                <h1>Sound engineered in the underground.</h1>
+                <p>P2K is a producer, beatmaker and remix artist building a catalog of raw, genre-bending sound — from hard-hitting hip-hop and dubstep to experimental cuts that don't fit in any one box.</p>
+                <p>Everything here is made, mixed and released independently. Preview any track for 30 seconds free, then own the full studio version and support the movement directly — no middlemen.</p>
+                <div class="about-tags">
+                    <span class="about-tag">Hip-Hop</span>
+                    <span class="about-tag">Dubstep</span>
+                    <span class="about-tag">Remix</span>
+                    <span class="about-tag">Experimental</span>
+                    <span class="about-tag">Beats</span>
+                    <span class="about-tag">Independent</span>
+                </div>
+            </div>
+        </div>
+    </section>
+    </main>
+
+    <div class="floating-music" id="floatingPlayer">
+        <div style="display:flex; align-items:center; gap:1rem;">
+            <button class="play-btn" id="globalPlayBtn" style="width:42px; height:42px;"><i class="fas fa-play"></i></button>
+            <div style="flex:1;">
+                <div style="display:flex; align-items:center; gap:0.6rem;">
+                    <div class="eq"><span></span><span></span><span></span><span></span></div>
+                    <div id="currentSongTitle" style="font-size:0.9rem; font-weight:600;">No song playing</div>
+                </div>
+                <div class="progress-bar" id="globalProgress" style="margin-top:0.5rem;"><div class="progress-fill" id="globalProgressFill"></div></div>
+            </div>
+        </div>
+    </div>
+    <button id="backToTop" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Back to top"><i class="fas fa-arrow-up"></i></button>
+    <div class="cookie-banner" id="cookieBanner">
+        <div class="cookie-text"><strong><i class="fas fa-cookie-bite"></i> Cookies</strong>We use cookies for analytics and to show ads that help keep the music free. You can accept or reject — your choice is remembered.</div>
+        <div class="cookie-actions"><button class="cookie-btn reject" onclick="setCookieConsent('rejected')">Reject</button><button class="cookie-btn accept" onclick="setCookieConsent('accepted')">Accept</button></div>
+    </div>
+    <footer class="footer">
+        <a href="index.html" class="logo" style="font-size:1.5rem; justify-content:center;"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+        <div class="footer-nav">
+            <a href="about.html">About</a><a href="music.html">Music</a><a href="podcast.html">Podcast</a><a href="videos.html">Videos</a><a href="tour.html">Tour</a><a href="gallery.html">Gallery</a><a href="merch.html">Merch</a><a href="news.html">News</a><a href="contact.html">Contact</a><a href="admin.html">Admin</a><a href="#" onclick="openCookieSettings(); return false;">Cookie Settings</a>
+        </div>
+        <p class="fine">&copy; 2024 p2k-music.ca — All rights reserved. Professional Artist Portfolio &amp; Music Platform.</p>
+    </footer>
+
+    <script src="assets/app.js"></script>
+</body>
+</html>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gallery — p2k-music.ca</title>
+    <meta name="description" content="Photos from the studio and the stage.">
+    <meta name="theme-color" content="#05060d">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%2305060d'/%3E%3Ccircle cx='32' cy='32' r='24' fill='none' stroke='%2300d4ff' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='%23ff2d95' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%23ffc439'/%3E%3C/svg%3E">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="p2k-music.ca">
+    <meta property="og:title" content="Gallery — P2K">
+    <meta property="og:description" content="Photos from the studio and the stage.">
+    <meta property="og:url" content="https://p2k-music.ca/gallery.html">
+    <meta property="og:image" content="https://p2k-music.ca/background.jpg">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-2580922665149434" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body data-page="gallery">
+    <div id="loader"><div class="loader-logo">p2k-music</div><div class="loader-bar"><span></span></div><div class="loader-sub">Loading the sound</div></div>
+    <div id="scrollProgress"></div>
+    <div id="cursorGlow"></div>
+    <canvas id="fxParticles"></canvas>
+    <canvas id="pageViz" class="page-viz"></canvas>
+    <div class="custom-bg" id="customBg" style="background-image: url('background.jpg');"></div>
+    <nav class="navbar" id="navbar">
+        <div class="nav-container">
+            <a href="index.html" class="logo"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+            <ul class="nav-links" id="navLinks">
+                <li><a class="navlink" data-nav="home" href="index.html">Home</a></li>
+                <li><a class="navlink" data-nav="about" href="about.html">About</a></li>
+                <li><a class="navlink" data-nav="music" href="music.html">Music</a></li>
+                <li><a class="navlink" data-nav="podcast" href="podcast.html">Podcast</a></li>
+                <li><a class="navlink" data-nav="videos" href="videos.html">Videos</a></li>
+                <li><a class="navlink" data-nav="tour" href="tour.html">Tour</a></li>
+                <li><a class="navlink" data-nav="gallery" href="gallery.html">Gallery</a></li>
+                <li><a class="navlink" data-nav="merch" href="merch.html">Merch</a></li>
+                <li><a class="navlink" data-nav="news" href="news.html">News</a></li>
+                <li><a class="navlink" data-nav="contact" href="contact.html">Contact</a></li>
+            </ul>
+            <div class="nav-right">
+                <span class="admin-badge" id="adminBadge" style="display:none;"><i class="fas fa-shield-alt"></i> Admin</span>
+                <button class="logout-btn" id="logoutBtn" onclick="logout()">Logout</button>
+                <a class="admin-button" id="adminLoginBtn" href="admin.html">Admin</a>
+                <div class="mobile-toggle" id="mobileToggle"><i class="fas fa-bars"></i></div>
+            </div>
+        </div>
+    </nav>
+    <main class="page-main" style="padding-top: calc(var(--nav-h) + 0.5rem);">
+<section id="gallery" class="section">
+        <div class="section-head">
+            <span class="section-kicker">Visuals</span>
+            <h2 class="section-title">Photo Gallery</h2>
+            <p class="section-sub">Tap any photo to set it as the site background.</p>
+        </div>
+        <div class="gallery-grid" id="galleryGrid">
+            <!-- Gallery loaded here -->
+        </div>
+    </section>
+    </main>
+
+    <div class="floating-music" id="floatingPlayer">
+        <div style="display:flex; align-items:center; gap:1rem;">
+            <button class="play-btn" id="globalPlayBtn" style="width:42px; height:42px;"><i class="fas fa-play"></i></button>
+            <div style="flex:1;">
+                <div style="display:flex; align-items:center; gap:0.6rem;">
+                    <div class="eq"><span></span><span></span><span></span><span></span></div>
+                    <div id="currentSongTitle" style="font-size:0.9rem; font-weight:600;">No song playing</div>
+                </div>
+                <div class="progress-bar" id="globalProgress" style="margin-top:0.5rem;"><div class="progress-fill" id="globalProgressFill"></div></div>
+            </div>
+        </div>
+    </div>
+    <button id="backToTop" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Back to top"><i class="fas fa-arrow-up"></i></button>
+    <div class="cookie-banner" id="cookieBanner">
+        <div class="cookie-text"><strong><i class="fas fa-cookie-bite"></i> Cookies</strong>We use cookies for analytics and to show ads that help keep the music free. You can accept or reject — your choice is remembered.</div>
+        <div class="cookie-actions"><button class="cookie-btn reject" onclick="setCookieConsent('rejected')">Reject</button><button class="cookie-btn accept" onclick="setCookieConsent('accepted')">Accept</button></div>
+    </div>
+    <footer class="footer">
+        <a href="index.html" class="logo" style="font-size:1.5rem; justify-content:center;"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+        <div class="footer-nav">
+            <a href="about.html">About</a><a href="music.html">Music</a><a href="podcast.html">Podcast</a><a href="videos.html">Videos</a><a href="tour.html">Tour</a><a href="gallery.html">Gallery</a><a href="merch.html">Merch</a><a href="news.html">News</a><a href="contact.html">Contact</a><a href="admin.html">Admin</a><a href="#" onclick="openCookieSettings(); return false;">Cookie Settings</a>
+        </div>
+        <p class="fine">&copy; 2024 p2k-music.ca — All rights reserved. Professional Artist Portfolio &amp; Music Platform.</p>
+    </footer>
+
+    <script src="assets/app.js"></script>
+</body>
+</html>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Merch — p2k-music.ca</title>
+    <meta name="description" content="Official P2K merch — tees, hoodies, vinyl and stickers.">
+    <meta name="theme-color" content="#05060d">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%2305060d'/%3E%3Ccircle cx='32' cy='32' r='24' fill='none' stroke='%2300d4ff' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='%23ff2d95' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%23ffc439'/%3E%3C/svg%3E">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="p2k-music.ca">
+    <meta property="og:title" content="Merch — P2K">
+    <meta property="og:description" content="Official P2K merch — tees, hoodies, vinyl and stickers.">
+    <meta property="og:url" content="https://p2k-music.ca/merch.html">
+    <meta property="og:image" content="https://p2k-music.ca/background.jpg">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-2580922665149434" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body data-page="merch">
+    <div id="loader"><div class="loader-logo">p2k-music</div><div class="loader-bar"><span></span></div><div class="loader-sub">Loading the sound</div></div>
+    <div id="scrollProgress"></div>
+    <div id="cursorGlow"></div>
+    <canvas id="fxParticles"></canvas>
+    <canvas id="pageViz" class="page-viz"></canvas>
+    <div class="custom-bg" id="customBg" style="background-image: url('background.jpg');"></div>
+    <nav class="navbar" id="navbar">
+        <div class="nav-container">
+            <a href="index.html" class="logo"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+            <ul class="nav-links" id="navLinks">
+                <li><a class="navlink" data-nav="home" href="index.html">Home</a></li>
+                <li><a class="navlink" data-nav="about" href="about.html">About</a></li>
+                <li><a class="navlink" data-nav="music" href="music.html">Music</a></li>
+                <li><a class="navlink" data-nav="podcast" href="podcast.html">Podcast</a></li>
+                <li><a class="navlink" data-nav="videos" href="videos.html">Videos</a></li>
+                <li><a class="navlink" data-nav="tour" href="tour.html">Tour</a></li>
+                <li><a class="navlink" data-nav="gallery" href="gallery.html">Gallery</a></li>
+                <li><a class="navlink" data-nav="merch" href="merch.html">Merch</a></li>
+                <li><a class="navlink" data-nav="news" href="news.html">News</a></li>
+                <li><a class="navlink" data-nav="contact" href="contact.html">Contact</a></li>
+            </ul>
+            <div class="nav-right">
+                <span class="admin-badge" id="adminBadge" style="display:none;"><i class="fas fa-shield-alt"></i> Admin</span>
+                <button class="logout-btn" id="logoutBtn" onclick="logout()">Logout</button>
+                <a class="admin-button" id="adminLoginBtn" href="admin.html">Admin</a>
+                <div class="mobile-toggle" id="mobileToggle"><i class="fas fa-bars"></i></div>
+            </div>
+        </div>
+    </nav>
+    <main class="page-main" style="padding-top: calc(var(--nav-h) + 0.5rem);">
+<section id="merch" class="section">
+        <div class="section-head">
+            <span class="section-kicker">Represent</span>
+            <h2 class="section-title">Merch</h2>
+            <p class="section-sub">Wear the sound. Limited runs, dropped alongside new releases.</p>
+        </div>
+        <div class="merch-grid">
+            <div class="merch-card reveal">
+                <div class="merch-thumb"><i class="fas fa-shirt"></i></div>
+                <div class="merch-body"><h4>P2K Logo Tee</h4><div class="m-price">$32 CAD</div><button class="btn" onclick="openMerchModal('tee')"><i class="fas fa-cart-plus"></i> Add to Cart</button></div>
+            </div>
+            <div class="merch-card reveal d1">
+                <div class="merch-thumb"><i class="fas fa-vest"></i></div>
+                <div class="merch-body"><h4>Underground Hoodie</h4><div class="m-price">$64 CAD</div><button class="btn" onclick="openMerchModal('hoodie')"><i class="fas fa-cart-plus"></i> Add to Cart</button></div>
+            </div>
+            <div class="merch-card reveal d2">
+                <div class="merch-thumb"><i class="fas fa-record-vinyl"></i></div>
+                <div class="merch-body"><h4>Limited Vinyl</h4><div class="m-price">$40 CAD</div><button class="btn" onclick="openMerchModal('vinyl')"><i class="fas fa-cart-plus"></i> Add to Cart</button></div>
+            </div>
+            <div class="merch-card reveal d3">
+                <div class="merch-thumb"><i class="fas fa-compact-disc"></i></div>
+                <div class="merch-body"><h4>Sticker Pack</h4><div class="m-price">$12 CAD</div><button class="btn" onclick="openMerchModal('stickers')"><i class="fas fa-cart-plus"></i> Add to Cart</button></div>
+            </div>
+        </div>
+    </section>
+    </main>
+    <div class="ticket-modal" id="merchModal">
+        <div class="ticket-box">
+            <button class="tm-close" onclick="closeMerchModal()" aria-label="Close">&times;</button>
+            <h3><i class="fas fa-bag-shopping"></i> Checkout</h3>
+            <div class="mm-icon" id="mmIcon"><i class="fas fa-shirt"></i></div>
+            <div class="tm-event"><b id="mmName">Item</b></div>
+            <div class="tm-price" id="mmUnit">$0 CAD</div>
+            <div id="mmSizeWrap" style="display:none; text-align:left;">
+                <label class="mm-label"><i class="fas fa-ruler"></i> Size</label>
+                <select id="mmSize" class="tm-input" onchange="updateMerchTotal()"></select>
+            </div>
+            <div class="mm-qty">
+                <span class="mm-label" style="margin:0;">Quantity</span>
+                <div class="qty-ctrls">
+                    <button type="button" onclick="mmQty(-1)">&minus;</button>
+                    <span id="mmQtyVal">1</span>
+                    <button type="button" onclick="mmQty(1)">+</button>
+                </div>
+            </div>
+            <div class="mm-total">Total <b id="mmTotal">$0 CAD</b></div>
+            <div id="mmPayContainer"></div>
+            <button class="paypal-cancel-btn" onclick="closeMerchModal()">Cancel</button>
+        </div>
+    </div>
+
+    
+    <div class="floating-music" id="floatingPlayer">
+        <div style="display:flex; align-items:center; gap:1rem;">
+            <button class="play-btn" id="globalPlayBtn" style="width:42px; height:42px;"><i class="fas fa-play"></i></button>
+            <div style="flex:1;">
+                <div style="display:flex; align-items:center; gap:0.6rem;">
+                    <div class="eq"><span></span><span></span><span></span><span></span></div>
+                    <div id="currentSongTitle" style="font-size:0.9rem; font-weight:600;">No song playing</div>
+                </div>
+                <div class="progress-bar" id="globalProgress" style="margin-top:0.5rem;"><div class="progress-fill" id="globalProgressFill"></div></div>
+            </div>
+        </div>
+    </div>
+    <button id="backToTop" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Back to top"><i class="fas fa-arrow-up"></i></button>
+    <div class="cookie-banner" id="cookieBanner">
+        <div class="cookie-text"><strong><i class="fas fa-cookie-bite"></i> Cookies</strong>We use cookies for analytics and to show ads that help keep the music free. You can accept or reject — your choice is remembered.</div>
+        <div class="cookie-actions"><button class="cookie-btn reject" onclick="setCookieConsent('rejected')">Reject</button><button class="cookie-btn accept" onclick="setCookieConsent('accepted')">Accept</button></div>
+    </div>
+    <footer class="footer">
+        <a href="index.html" class="logo" style="font-size:1.5rem; justify-content:center;"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+        <div class="footer-nav">
+            <a href="about.html">About</a><a href="music.html">Music</a><a href="podcast.html">Podcast</a><a href="videos.html">Videos</a><a href="tour.html">Tour</a><a href="gallery.html">Gallery</a><a href="merch.html">Merch</a><a href="news.html">News</a><a href="contact.html">Contact</a><a href="admin.html">Admin</a><a href="#" onclick="openCookieSettings(); return false;">Cookie Settings</a>
+        </div>
+        <p class="fine">&copy; 2024 p2k-music.ca — All rights reserved. Professional Artist Portfolio &amp; Music Platform.</p>
+    </footer>
+
+    <script src="assets/app.js"></script>
+</body>
+</html>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Music — p2k-music.ca</title>
+    <meta name="description" content="Stream 30-second previews and buy full tracks from P2K.">
+    <meta name="theme-color" content="#05060d">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%2305060d'/%3E%3Ccircle cx='32' cy='32' r='24' fill='none' stroke='%2300d4ff' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='%23ff2d95' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%23ffc439'/%3E%3C/svg%3E">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="p2k-music.ca">
+    <meta property="og:title" content="Music — P2K Full Catalog">
+    <meta property="og:description" content="Stream 30-second previews and buy full tracks from P2K.">
+    <meta property="og:url" content="https://p2k-music.ca/music.html">
+    <meta property="og:image" content="https://p2k-music.ca/background.jpg">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-2580922665149434" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body data-page="music">
+    <div id="loader"><div class="loader-logo">p2k-music</div><div class="loader-bar"><span></span></div><div class="loader-sub">Loading the sound</div></div>
+    <div id="scrollProgress"></div>
+    <div id="cursorGlow"></div>
+    <canvas id="fxParticles"></canvas>
+    <canvas id="pageViz" class="page-viz"></canvas>
+    <div class="custom-bg" id="customBg" style="background-image: url('background.jpg');"></div>
+    <nav class="navbar" id="navbar">
+        <div class="nav-container">
+            <a href="index.html" class="logo"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+            <ul class="nav-links" id="navLinks">
+                <li><a class="navlink" data-nav="home" href="index.html">Home</a></li>
+                <li><a class="navlink" data-nav="about" href="about.html">About</a></li>
+                <li><a class="navlink" data-nav="music" href="music.html">Music</a></li>
+                <li><a class="navlink" data-nav="podcast" href="podcast.html">Podcast</a></li>
+                <li><a class="navlink" data-nav="videos" href="videos.html">Videos</a></li>
+                <li><a class="navlink" data-nav="tour" href="tour.html">Tour</a></li>
+                <li><a class="navlink" data-nav="gallery" href="gallery.html">Gallery</a></li>
+                <li><a class="navlink" data-nav="merch" href="merch.html">Merch</a></li>
+                <li><a class="navlink" data-nav="news" href="news.html">News</a></li>
+                <li><a class="navlink" data-nav="contact" href="contact.html">Contact</a></li>
+            </ul>
+            <div class="nav-right">
+                <span class="admin-badge" id="adminBadge" style="display:none;"><i class="fas fa-shield-alt"></i> Admin</span>
+                <button class="logout-btn" id="logoutBtn" onclick="logout()">Logout</button>
+                <a class="admin-button" id="adminLoginBtn" href="admin.html">Admin</a>
+                <div class="mobile-toggle" id="mobileToggle"><i class="fas fa-bars"></i></div>
+            </div>
+        </div>
+    </nav>
+    <main class="page-main" style="padding-top: calc(var(--nav-h) + 0.5rem);">
+<section id="music" class="section">
+        <div class="section-head">
+            <span class="section-kicker">Full Catalog</span>
+            <h2 class="section-title">Music Collection</h2>
+            <p class="section-sub">Preview 30 seconds free &bull; Buy for $16 to download &amp; play the full track.</p>
+        </div>
+        <div class="library-bar">
+            <div class="library-search"><i class="fas fa-magnifying-glass"></i><input type="text" id="songSearch" placeholder="Search the library…" autocomplete="off"></div>
+            <div class="library-count"><span id="songCount">0</span> tracks</div>
+            <select id="songSort" class="library-sort" title="Sort">
+                <option value="default">Catalog order</option>
+                <option value="az">Title A–Z</option>
+                <option value="za">Title Z–A</option>
+            </select>
+        </div>
+        <div class="songs-grid" id="songsGrid">
+            <!-- Songs loaded here -->
+        </div>
+    </section>
+    <div class="ad-slot">
+        <span class="ad-label">Advertisement</span>
+        <ins class="adsbygoogle" style="display:block" data-ad-client="ca-pub-2580922665149434" data-ad-slot="REPLACE_WITH_AD_SLOT_ID" data-ad-format="auto" data-full-width-responsive="true"></ins>
+    </div>
+
+    </main>
+    <div class="paypal-modal" id="paypalModal">
+        <div class="paypal-box">
+            <h3><i class="fab fa-paypal"></i> Purchase Track</h3>
+            <div class="song-info" id="paypalSongTitle"></div>
+            <div class="price-big">$16.00 CAD</div>
+            <div id="paypal-button-container"></div>
+            <button class="paypal-cancel-btn" onclick="closePaypalModal()">Cancel</button>
+        </div>
+    </div>
+
+    
+    <div class="floating-music" id="floatingPlayer">
+        <div style="display:flex; align-items:center; gap:1rem;">
+            <button class="play-btn" id="globalPlayBtn" style="width:42px; height:42px;"><i class="fas fa-play"></i></button>
+            <div style="flex:1;">
+                <div style="display:flex; align-items:center; gap:0.6rem;">
+                    <div class="eq"><span></span><span></span><span></span><span></span></div>
+                    <div id="currentSongTitle" style="font-size:0.9rem; font-weight:600;">No song playing</div>
+                </div>
+                <div class="progress-bar" id="globalProgress" style="margin-top:0.5rem;"><div class="progress-fill" id="globalProgressFill"></div></div>
+            </div>
+        </div>
+    </div>
+    <button id="backToTop" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Back to top"><i class="fas fa-arrow-up"></i></button>
+    <div class="cookie-banner" id="cookieBanner">
+        <div class="cookie-text"><strong><i class="fas fa-cookie-bite"></i> Cookies</strong>We use cookies for analytics and to show ads that help keep the music free. You can accept or reject — your choice is remembered.</div>
+        <div class="cookie-actions"><button class="cookie-btn reject" onclick="setCookieConsent('rejected')">Reject</button><button class="cookie-btn accept" onclick="setCookieConsent('accepted')">Accept</button></div>
+    </div>
+    <footer class="footer">
+        <a href="index.html" class="logo" style="font-size:1.5rem; justify-content:center;"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+        <div class="footer-nav">
+            <a href="about.html">About</a><a href="music.html">Music</a><a href="podcast.html">Podcast</a><a href="videos.html">Videos</a><a href="tour.html">Tour</a><a href="gallery.html">Gallery</a><a href="merch.html">Merch</a><a href="news.html">News</a><a href="contact.html">Contact</a><a href="admin.html">Admin</a><a href="#" onclick="openCookieSettings(); return false;">Cookie Settings</a>
+        </div>
+        <p class="fine">&copy; 2024 p2k-music.ca — All rights reserved. Professional Artist Portfolio &amp; Music Platform.</p>
+    </footer>
+
+    <script src="assets/app.js"></script>
+</body>
+</html>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>News — p2k-music.ca</title>
+    <meta name="description" content="Latest announcements and updates from P2K.">
+    <meta name="theme-color" content="#05060d">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%2305060d'/%3E%3Ccircle cx='32' cy='32' r='24' fill='none' stroke='%2300d4ff' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='%23ff2d95' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%23ffc439'/%3E%3C/svg%3E">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="p2k-music.ca">
+    <meta property="og:title" content="News & Updates — P2K">
+    <meta property="og:description" content="Latest announcements and updates from P2K.">
+    <meta property="og:url" content="https://p2k-music.ca/news.html">
+    <meta property="og:image" content="https://p2k-music.ca/background.jpg">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-2580922665149434" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body data-page="news">
+    <div id="loader"><div class="loader-logo">p2k-music</div><div class="loader-bar"><span></span></div><div class="loader-sub">Loading the sound</div></div>
+    <div id="scrollProgress"></div>
+    <div id="cursorGlow"></div>
+    <canvas id="fxParticles"></canvas>
+    <canvas id="pageViz" class="page-viz"></canvas>
+    <div class="custom-bg" id="customBg" style="background-image: url('background.jpg');"></div>
+    <nav class="navbar" id="navbar">
+        <div class="nav-container">
+            <a href="index.html" class="logo"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+            <ul class="nav-links" id="navLinks">
+                <li><a class="navlink" data-nav="home" href="index.html">Home</a></li>
+                <li><a class="navlink" data-nav="about" href="about.html">About</a></li>
+                <li><a class="navlink" data-nav="music" href="music.html">Music</a></li>
+                <li><a class="navlink" data-nav="podcast" href="podcast.html">Podcast</a></li>
+                <li><a class="navlink" data-nav="videos" href="videos.html">Videos</a></li>
+                <li><a class="navlink" data-nav="tour" href="tour.html">Tour</a></li>
+                <li><a class="navlink" data-nav="gallery" href="gallery.html">Gallery</a></li>
+                <li><a class="navlink" data-nav="merch" href="merch.html">Merch</a></li>
+                <li><a class="navlink" data-nav="news" href="news.html">News</a></li>
+                <li><a class="navlink" data-nav="contact" href="contact.html">Contact</a></li>
+            </ul>
+            <div class="nav-right">
+                <span class="admin-badge" id="adminBadge" style="display:none;"><i class="fas fa-shield-alt"></i> Admin</span>
+                <button class="logout-btn" id="logoutBtn" onclick="logout()">Logout</button>
+                <a class="admin-button" id="adminLoginBtn" href="admin.html">Admin</a>
+                <div class="mobile-toggle" id="mobileToggle"><i class="fas fa-bars"></i></div>
+            </div>
+        </div>
+    </nav>
+    <main class="page-main" style="padding-top: calc(var(--nav-h) + 0.5rem);">
+<section id="news" class="section">
+        <div class="section-head">
+            <span class="section-kicker">Straight From The Studio</span>
+            <h2 class="section-title">News &amp; Updates</h2>
+        </div>
+        <div class="news-section" id="newsContainer">
+            <div class="no-news">No news posted yet. Check back soon!</div>
+        </div>
+    </section>
+    <div class="ad-slot">
+        <span class="ad-label">Advertisement</span>
+        <ins class="adsbygoogle" style="display:block" data-ad-client="ca-pub-2580922665149434" data-ad-slot="REPLACE_WITH_AD_SLOT_ID" data-ad-format="auto" data-full-width-responsive="true"></ins>
+    </div>
+
+    </main>
+
+    <div class="floating-music" id="floatingPlayer">
+        <div style="display:flex; align-items:center; gap:1rem;">
+            <button class="play-btn" id="globalPlayBtn" style="width:42px; height:42px;"><i class="fas fa-play"></i></button>
+            <div style="flex:1;">
+                <div style="display:flex; align-items:center; gap:0.6rem;">
+                    <div class="eq"><span></span><span></span><span></span><span></span></div>
+                    <div id="currentSongTitle" style="font-size:0.9rem; font-weight:600;">No song playing</div>
+                </div>
+                <div class="progress-bar" id="globalProgress" style="margin-top:0.5rem;"><div class="progress-fill" id="globalProgressFill"></div></div>
+            </div>
+        </div>
+    </div>
+    <button id="backToTop" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Back to top"><i class="fas fa-arrow-up"></i></button>
+    <div class="cookie-banner" id="cookieBanner">
+        <div class="cookie-text"><strong><i class="fas fa-cookie-bite"></i> Cookies</strong>We use cookies for analytics and to show ads that help keep the music free. You can accept or reject — your choice is remembered.</div>
+        <div class="cookie-actions"><button class="cookie-btn reject" onclick="setCookieConsent('rejected')">Reject</button><button class="cookie-btn accept" onclick="setCookieConsent('accepted')">Accept</button></div>
+    </div>
+    <footer class="footer">
+        <a href="index.html" class="logo" style="font-size:1.5rem; justify-content:center;"><i class="fas fa-compact-disc"></i> p2k-music.ca</a>
+        <div class="footer-nav">
+            <a href="about.html">About</a><a href="music.html">Music</a><a href="podcast.html">Podcast</a><a href="videos.html">Videos</a><a href="tour.html">Tour</a><a href="gallery.html">Gallery</a><a href="merch.html">Merch</a><a href="news.html">News</a><a href="contact.html">Contact</a><a href="admin.html">Admin</a><a href="#" onclick="openCookieSettings(); return false;">Cookie Settings</a>
+        </div>
+        <p class="fine">&copy; 2024 p2k-music.ca — All rights reserved. Professional Artist Portfolio &amp; Music Platform.</p>
+    </footer>
+
+    <script src="assets/app.js"></script>
+</body>
+</html>
