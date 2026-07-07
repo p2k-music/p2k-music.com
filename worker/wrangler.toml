@@ -1,0 +1,48 @@
+# ============================================================
+#  p2k-music.ca — Cloudflare Worker config
+#  Deploy:  cd worker && wrangler deploy
+#  Local:   cd worker && wrangler dev   (uses a local D1 + local assets)
+# ============================================================
+name = "p2k-music"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+workers_dev = true
+
+# build-assets.mjs stages ONLY the public site into worker/public/ (backend,
+# git history, docs and secrets are never uploaded). Wrangler runs it first.
+[build]
+command = "node build-assets.mjs"
+
+# Static site served through the Worker so every response gets the security
+# headers + path blocking. run_worker_first routes ALL requests to the Worker,
+# which calls env.ASSETS for real files.
+[assets]
+directory = "public"
+binding = "ASSETS"
+run_worker_first = true
+
+# D1 (SQLite at the edge) — the money/admin/ticket source of truth.
+[[d1_databases]]
+binding = "DB"
+database_name = "p2k-music"
+database_id = "bbe02418-8c12-49f4-bc81-bf31f2f05824"
+
+# Nightly retention prune (login codes / ip counters / dormant visitors).
+[triggers]
+crons = ["0 4 * * *"]
+
+[observability]
+enabled = true
+
+# ---- Non-secret vars (safe to commit). Secrets go via `wrangler secret put`:
+#   SESSION_SECRET  (REQUIRED — random 48+ hex chars; sign sessions/CSRF/tickets)
+#   ADMIN1_PASS ADMIN2_PASS
+#   SMTP_USER SMTP_PASS
+#   PAYPAL_CLIENT_ID PAYPAL_SECRET PAYPAL_WEBHOOK_ID
+[vars]
+CURRENCY = "CAD"
+SONG_PRICE = "16"
+PAYOUT_EMAIL = "p2key1@gmail.com"
+MIN_WITHDRAW = "1.55"
+BEHIND_TLS = "true"
+PAYPAL_ENV = "production"

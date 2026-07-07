@@ -1,9 +1,34 @@
 # Deploying p2k-music.ca
 
-The site is a static front end **plus a required Node backend** (payments, tickets,
-admin 2FA, wallet — all in `server/`, SQLite on disk). That means it needs a host that
-runs a **persistent Node 22+ process with a persistent disk** — plain static hosting
-(GitHub Pages / Netlify static) will NOT work.
+The site is a static front end **plus a required backend** (payments, tickets, admin
+2FA, wallet). There are two supported backends — pick one:
+
+- **Cloudflare Workers + D1** (`worker/`) — global edge, ~free, no server to run.
+  **This is the primary target.** Full guide: [`worker/README.md`](worker/README.md).
+- **Node 22+ server** (`server/`) — a persistent process with a persistent disk
+  (Render / Fly / VPS). Guide below.
+
+Either way, plain static hosting (GitHub Pages / Netlify static) will NOT work — the
+API is required.
+
+---
+
+## Option 0 — Cloudflare Workers + D1 (recommended, DNS already on Cloudflare)
+
+```sh
+cd worker
+wrangler d1 execute p2k-music --remote --file schema.sql   # schema (D1 already created)
+wrangler secret put SESSION_SECRET     # + ADMIN1_PASS ADMIN2_PASS SMTP_USER SMTP_PASS
+wrangler secret put PAYPAL_CLIENT_ID   # + PAYPAL_SECRET PAYPAL_WEBHOOK_ID
+wrangler deploy
+```
+Then Workers → Settings → Domains & Routes → add `p2k-music.ca` + `www`. Certificate is
+automatic. See [`worker/README.md`](worker/README.md) for the full walkthrough and how
+the Node↔Worker pieces map.
+
+The rest of this doc covers the **Node** backend option.
+
+---
 
 > ⚠️ Never deploy `server/.env` or `server/data/` — secrets go into the host's
 > environment-variable dashboard, and the database lives on the host's persistent disk.

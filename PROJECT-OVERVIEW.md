@@ -227,6 +227,18 @@ finding verified, then fixed:
 - **Repo**: removed cruft (`index - Copy.html`, `index.original.backup.html`,
   `p2k website instruct.txt` — the last was publicly web-served).
 
+## 16. Cloudflare Workers backend (`worker/`)
+
+A faithful edge port of `server/` on **D1** (SQLite at the edge) — global, ~free,
+no server to run. Same security model, verified on real workerd + D1. The Node
+backend (`server/`) still works for local dev; the Worker is the primary deploy
+target. Mapping + deploy steps: [`worker/README.md`](worker/README.md) and
+[`DEPLOY.md`](DEPLOY.md) §0. Highlights: scrypt→PBKDF2 (WebCrypto), in-memory
+rate-limit→D1 fixed-window, `node:tls` SMTP→`cloudflare:sockets`, filesystem
+static→Workers Assets (only git-tracked public files are staged via
+`build-assets.mjs`; backend/secrets/history are never uploaded), prune
+`setInterval`→cron `scheduled()`. D1 database `p2k-music` already created.
+
 ## 15. End-to-end PayPal checkout (R4 closed)
 
 Real buyer-approval checkout replaces the old honor-system `_xclick` links.
