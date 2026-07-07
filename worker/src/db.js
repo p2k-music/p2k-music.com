@@ -8,16 +8,26 @@
 export const d = (cents) => Math.round(cents) / 100;
 export const today = () => new Date().toISOString().slice(0, 10);
 
-// Seed the two admin accounts on first request (idempotent).
-export async function ensureAdmins(DB, cfg, hashPasscode) {
-  for (const a of cfg.admins) {
-    if (!a.email) continue;
-    const existing = await DB.prepare('SELECT email FROM admins WHERE email = ?').bind(a.email).first();
-    if (existing) continue;
-    if (!a.pass) { console.warn(`[SECURITY] admin ${a.email} has no ADMIN*_PASS set — cannot seed; set it as a secret.`); continue; }
-    await DB.prepare('INSERT OR IGNORE INTO admins(email, pass_hash, created_at) VALUES(?, ?, ?)')
-      .bind(a.email, await hashPasscode(a.pass), Date.now()).run();
+// Make the stored admin password match the current ADMIN*_PASS secret.
+// Seeds the account on first login and adopts a rotated secret on the next —
+// so setting or changing the password in Cloudflare "just works" after redeploy.
+// A cheap fingerprint in kv means the expensive re-hash only runs when the
+// secret actually changed (normal logins pay a single SHA-256, not a PBKDF2).
+export async function syncAdminPassword(DB, cfg, email, hashPasscode, sha256hex) {
+  const a = cfg.admins.find((x) => x.email === email && x.pass);
+  if (!a) return; // not a configured admin, or no ADMIN*_PASS set for it
+  const fp = await sha256hex('p2kadmin|' + a.pass);
+  const marker = await DB.prepare('SELECT v FROM kv WHERE k = ?').bind('admin_fp:' + email).first();
+  if (marker && marker.v === fp) return; // stored hash already reflects the current secret
+  const hash = await hashPasscode(a.pass);
+  const existing = await DB.prepare('SELECT email FROM admins WHERE email = ?').bind(email).first();
+  if (existing) {
+    // password (re)set by the owner → adopt it and clear any lockout
+    await DB.prepare('UPDATE admins SET pass_hash=?, fail_count=0, locked_until=0 WHERE email=?').bind(hash, email).run();
+  } else {
+    await DB.prepare('INSERT OR IGNORE INTO admins(email,pass_hash,created_at,fail_count,locked_until) VALUES(?,?,?,0,0)').bind(email, hash, Date.now()).run();
   }
+  await DB.prepare('INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v = excluded.v').bind('admin_fp:' + email, fp).run();
 }
 
 export async function getAdmin(DB, email) {

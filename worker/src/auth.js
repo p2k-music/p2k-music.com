@@ -49,6 +49,12 @@ export async function verifyPasscode(pass, stored) {
   } catch (_) { return false; }
 }
 
+// Fast (non-secret) hash — used only as a "has this changed?" fingerprint.
+export async function sha256hex(s) {
+  const buf = await crypto.subtle.digest('SHA-256', te.encode(String(s)));
+  return toHex(buf);
+}
+
 // ---- HMAC-signed tokens -------------------------------------------------
 async function hmac(secret, msg) {
   const key = await crypto.subtle.importKey('raw', te.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);

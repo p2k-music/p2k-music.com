@@ -162,6 +162,10 @@ async function handleApi(request, env, cfg, url) {
     if (body.error) return json(400, { error: body.error });
     const emailAddr = str(body.email, 160).trim().toLowerCase();
     const password = str(body.password, 200);
+    // Make this admin's stored password match the current ADMIN*_PASS secret
+    // (seeds the account on first login, adopts a rotated password thereafter).
+    // No-op for non-admin emails, so it can't be used to probe which exist.
+    if (emailAddr) await store.syncAdminPassword(DB, cfg, emailAddr, auth.hashPasscode, auth.sha256hex);
     const admin = emailAddr ? await store.getAdmin(DB, emailAddr) : null;
     const now = Date.now();
     const ok = await auth.verifyPasscode(password, admin ? admin.pass_hash : cfg._dummyHash);
@@ -393,14 +397,14 @@ async function serveStatic(request, env) {
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
 }
 
-let _seeded = false;
 export default {
   async fetch(request, env, ctx) {
     const cfg = makeConfig(env);
     if (!cfg.secret) return json(500, { error: 'server_misconfigured', detail: 'SESSION_SECRET not set' });
     cfg._dummyHash = env._DUMMY_HASH || (env._DUMMY_HASH = await auth.hashPasscode(auth.randomHex(8)));
     try {
-      if (!_seeded) { _seeded = true; ctx.waitUntil(store.ensureAdmins(env.DB, cfg, auth.hashPasscode)); }
+      // Admin accounts are seeded/synced on demand inside the login handler
+      // (see store.syncAdminPassword) — no fragile background seeding needed.
       const url = new URL(request.url);
       if (url.pathname.startsWith('/api/')) return await handleApi(request, env, cfg, url);
       const tm = url.pathname.match(/^\/t\/([\w-]+)\/?$/);

@@ -93,11 +93,15 @@ function Set-Secret($name, $value) {
   if ($LASTEXITCODE -ne 0) { Fail "Couldn't set $name" }
   Ok "$name set"
 }
-function Ask-Secret($name, $label) {
-  if ($have -contains $name) { Ok "$name already set (skipped)"; return }
+function Ask-Secret($name, $label, [switch]$Updatable) {
+  if ($have -contains $name) {
+    if (-not $Updatable) { Ok "$name already set (skipped)"; return }
+    $chg = Read-Host "    $name is already set - change it? (y/N)"
+    if ($chg -notmatch '^(y|yes)$') { Ok "$name kept as-is"; return }
+  }
   $sec = Read-Host -Prompt "    Enter $label" -AsSecureString
   $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
-  if ([string]::IsNullOrWhiteSpace($plain)) { Note "(left blank - $name not set)"; return }
+  if ([string]::IsNullOrWhiteSpace($plain)) { Note "(left blank - $name unchanged)"; return }
   Set-Secret $name $plain
 }
 
@@ -109,10 +113,12 @@ else {
   Note "Generated a random signing key for you."
 }
 
-Ask-Secret 'ADMIN1_PASS' 'admin password for tajallatajalla2@gmail.com'
-Ask-Secret 'ADMIN2_PASS' 'admin password for aaron.styles9393@gmail.com'
-Ask-Secret 'SMTP_USER'   'Gmail address that sends the login codes'
-Ask-Secret 'SMTP_PASS'   'Gmail App Password (login is locked until this is set)'
+# -Updatable: even if these are already set, you're offered a chance to change
+# them (so you can fix/rotate an admin password or the Gmail App Password here).
+Ask-Secret 'ADMIN1_PASS' 'admin password for tajallatajalla2@gmail.com' -Updatable
+Ask-Secret 'ADMIN2_PASS' 'admin password for aaron.styles9393@gmail.com' -Updatable
+Ask-Secret 'SMTP_USER'   'Gmail address that sends the login codes' -Updatable
+Ask-Secret 'SMTP_PASS'   'Gmail App Password (login is locked until this is set)' -Updatable
 
 Write-Host ""
 $pay = Read-Host "    Add PayPal keys now for REAL payments? (y/N)"
