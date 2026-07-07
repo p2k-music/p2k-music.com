@@ -22,10 +22,13 @@ binding = "ASSETS"
 run_worker_first = true
 
 # D1 (SQLite at the edge) — the money/admin/ticket source of truth.
+# ⚠️ database_id below is a PLACEHOLDER. Create your own D1 in YOUR Cloudflare
+# account and paste its id here — see worker/CLOUDFLARE-DEPLOY.md, Step 4.
+#   wrangler d1 create p2k-music   →   copy the printed database_id
 [[d1_databases]]
 binding = "DB"
 database_name = "p2k-music"
-database_id = "bbe02418-8c12-49f4-bc81-bf31f2f05824"
+database_id = "PASTE_YOUR_D1_DATABASE_ID_HERE"
 
 # Nightly retention prune (login codes / ip counters / dormant visitors).
 [triggers]

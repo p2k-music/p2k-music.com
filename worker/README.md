@@ -31,10 +31,15 @@ git-ignored.
 
 ## Deploy
 
+> **First time? Follow [`CLOUDFLARE-DEPLOY.md`](CLOUDFLARE-DEPLOY.md)** — a from-zero,
+> copy-paste walkthrough for deploying to your own Cloudflare account. The condensed
+> version:
+
 ```sh
 cd worker
 
-# 1) One-time: create D1 (already done: id in wrangler.toml) + apply schema
+# 1) One-time: create YOUR D1, paste its id into wrangler.toml, apply the schema
+wrangler d1 create p2k-music        # copy the database_id into wrangler.toml
 wrangler d1 execute p2k-music --remote --file schema.sql
 
 # 2) Secrets (NEVER commit these)
