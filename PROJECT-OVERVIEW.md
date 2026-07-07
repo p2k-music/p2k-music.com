@@ -181,7 +181,7 @@ payouts, CSP + security headers, Range-streaming static server with traversal gu
 - Residual security items (see audit): gate raw `audio/` download URLs (R2), server-side
   event/merch pricing (R3), PayPal JS SDK for real capture (R4), listen-earnings are a
   projection (B1), same-account payout question (B2).
-- **PR #1** (`admin-2fa-login`) holds the 2FA login work — merge it into `main`.
+- ~~PR #1 (`admin-2fa-login`)~~ — **merged into `main`** (commit `dade236`).
 
 ## 12. Backups & GitHub
 
@@ -198,7 +198,33 @@ photo); built the entire zero-dependency Node backend (auth, PayPal payments, wa
 payouts, tickets) + `SECURITY-AUDIT.md`; restyled the file converter into the site theme
 and linked it; pushed the project to GitHub and re-credited all history to P2K; then
 built the **two-account email-2FA admin login** and hardened it (fail-closed, lockout,
-no enumeration) — opened as **PR #1**.
+no enumeration) — merged as PR #1.
+
+**Enterprise-hardening pass (later on 2026-07-06)** — full multi-agent audit, every
+finding verified, then fixed:
+- **Server security**: case-insensitive static-server block-list (Windows/macOS `/SERVER/…`
+  could previously download the SQLite DB + signing secret); malformed-cookie 500 fixed;
+  `Cache-Control: no-store` on all API JSON; webhook body size-capped; lockout state now
+  revealed only after a correct password (no enumeration/lock oracle).
+- **Money integrity**: order capture made idempotent under concurrent requests (no double
+  revenue rows); PayPal capture rejects a missing/wrong `currency_code` (fail closed);
+  listen-tick no longer counts a freshly minted visitor identity (cookie-mint bypass of
+  the per-visitor cap closed).
+- **Ops**: fail-fast config validation at boot; deep `/api/health` (DB probe + uptime);
+  structured request logging (`LOG_REQUESTS`); graceful SIGINT/SIGTERM drain;
+  uncaughtException/unhandledRejection logging; header/request/keep-alive timeouts;
+  SQLite `synchronous=NORMAL` + `busy_timeout` + retention pruning (login codes, ip_day,
+  dormant visitors); SMTP client no longer hangs on clean disconnect and accepts a
+  display-name `SMTP_FROM`; legacy single-passcode code path removed.
+- **Front end**: all dynamic renders now HTML-escape (song titles, comments, news,
+  gallery); dead duplicate `updateAdminUI` removed; admin page prompts login from the
+  server session (legacy localStorage gate removed); placeholder AdSense units hidden;
+  News added to the navbar (+ active-state CSS); favicon + Open Graph/Twitter cards on
+  every page; keyboard access + aria-labels on cards/forms; `prefers-reduced-motion` +
+  `:focus-visible` support; track count corrected to 53; admin copy matches the 2FA flow;
+  contact page license contradiction fixed (all rights reserved, licensing via booking).
+- **Repo**: removed cruft (`index - Copy.html`, `index.original.backup.html`,
+  `p2k website instruct.txt` — the last was publicly web-served).
 
 ## 14. Working on this project with Claude
 

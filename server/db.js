@@ -15,6 +15,8 @@ const db = new DatabaseSync(path.join(config.dataDir, 'p2k.db'));
 
 db.exec(`
   PRAGMA journal_mode = WAL;
+  PRAGMA synchronous = NORMAL;   -- WAL-safe durability without per-write fsync stalls
+  PRAGMA busy_timeout = 5000;
   PRAGMA foreign_keys = ON;
 
   CREATE TABLE IF NOT EXISTS kv (
@@ -115,6 +117,24 @@ db.exec(`
 for (const col of ['fail_count', 'locked_until']) {
   try { db.exec(`ALTER TABLE admins ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`); } catch (_) { /* already present */ }
 }
+
+db.exec('CREATE INDEX IF NOT EXISTS idx_tickets_order_id ON tickets(order_id)');
+
+// ---- retention: expired/ephemeral rows must not accumulate forever -------
+const DAY_MS = 86_400_000;
+const _pruneCodes = db.prepare('DELETE FROM login_codes WHERE expires_at < ?');
+const _pruneIpDay = db.prepare('DELETE FROM ip_day WHERE day < ?');
+const _pruneVisitors = db.prepare('DELETE FROM visitors WHERE last_tick_at < ? AND created_at < ?');
+function pruneExpired() {
+  const now = Date.now();
+  try {
+    _pruneCodes.run(now - 3600_000);                                    // 2FA codes: 1h past expiry
+    _pruneIpDay.run(new Date(now - 2 * DAY_MS).toISOString().slice(0, 10)); // per-IP day counters: 2 days
+    _pruneVisitors.run(now - 90 * DAY_MS, now - 90 * DAY_MS);           // dormant listen visitors: 90 days
+  } catch (e) { console.warn('[db] prune skipped:', e.message); }
+}
+pruneExpired();
+setInterval(pruneExpired, 6 * 3600_000).unref();
 
 // ---- kv helpers ---------------------------------------------------------
 const _kvGet = db.prepare('SELECT v FROM kv WHERE k = ?');

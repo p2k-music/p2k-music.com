@@ -745,7 +745,7 @@
             box-shadow: inset 0 0 0 1px rgba(0, 212, 255, 0.35);
             pointer-events: none;
         }
-        .about-text h3 {
+        .about-text h1, .about-text h3 {
             font-family: 'Orbitron', monospace;
             font-size: 1.7rem;
             margin-bottom: 1.1rem;
@@ -1352,6 +1352,7 @@ body[data-page="videos"]  .navlink[data-nav="videos"],
 body[data-page="tour"]    .navlink[data-nav="tour"],
 body[data-page="gallery"] .navlink[data-nav="gallery"],
 body[data-page="merch"]   .navlink[data-nav="merch"],
+body[data-page="news"]    .navlink[data-nav="news"],
 body[data-page="converter"] .navlink[data-nav="converter"],
 body[data-page="contact"] .navlink[data-nav="contact"] {
     background: linear-gradient(120deg, rgba(0, 212, 255, 0.24), rgba(255, 107, 107, 0.22));
@@ -1483,3 +1484,24 @@ body::before {
 
 /* aurora nebula dialed back to a faint colour ambience behind the ribbon photo */
 #auroraField .orb { opacity: 0.3; }
+
+/* ============================================================
+   ACCESSIBILITY
+   ============================================================ */
+/* Visible keyboard focus, on-theme (mouse clicks stay glow-only) */
+a:focus-visible, button:focus-visible, input:focus-visible,
+select:focus-visible, textarea:focus-visible, [role="button"]:focus-visible {
+    outline: 2px solid var(--cyan);
+    outline-offset: 2px;
+}
+
+/* Respect reduced-motion: freeze the ambient animation for users who ask —
+   the neon look survives, the constant movement doesn't. */
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+    }
+    html { scroll-behavior: auto; }
+}

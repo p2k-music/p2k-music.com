@@ -80,7 +80,9 @@ async function captureOrder(paypalOrderId, expectCents, currency) {
   // Amount check: the buyer must have paid at least what we expected, same currency.
   const cur = (cap.amount && cap.amount.currency_code) || (pu.amount && pu.amount.currency_code);
   if (!completed) return { ok: false, error: 'not_completed' };
-  if (expectCents != null && (paidCents < expectCents || (currency && cur && cur !== currency))) {
+  // Fail closed: a response missing currency_code counts as a mismatch —
+  // never accept an unverifiable currency on a money-unlocking path.
+  if (expectCents != null && (paidCents < expectCents || (currency && cur !== currency))) {
     return { ok: false, error: 'amount_mismatch', paidCents, currency: cur };
   }
   return { ok: true, demo: false, captureId: cap.id, amountCents: paidCents, currency: cur };

@@ -6,6 +6,14 @@
     <title>Podcast — p2k-music.ca</title>
     <meta name="description" content="The P2K Podcast — episodes, guests, and how to join the show.">
     <meta name="theme-color" content="#05060d">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%2305060d'/%3E%3Ccircle cx='32' cy='32' r='24' fill='none' stroke='%2300d4ff' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='%23ff2d95' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%23ffc439'/%3E%3C/svg%3E">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="p2k-music.ca">
+    <meta property="og:title" content="The P2K Podcast">
+    <meta property="og:description" content="The P2K Podcast — episodes, guests, and how to join the show.">
+    <meta property="og:url" content="https://p2k-music.ca/podcast.html">
+    <meta property="og:image" content="https://p2k-music.ca/background.jpg">
+    <meta name="twitter:card" content="summary_large_image">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
@@ -32,6 +40,7 @@
                 <li><a class="navlink" data-nav="tour" href="tour.html">Tour</a></li>
                 <li><a class="navlink" data-nav="gallery" href="gallery.html">Gallery</a></li>
                 <li><a class="navlink" data-nav="merch" href="merch.html">Merch</a></li>
+                <li><a class="navlink" data-nav="news" href="news.html">News</a></li>
                 <li><a class="navlink" data-nav="contact" href="contact.html">Contact</a></li>
             </ul>
             <div class="nav-right">
@@ -57,11 +66,11 @@
                 <p>Artist, producer, or just got a story worth telling? Pitch yourself as a guest and P2K will reach out.</p>
                 <form class="guest-form" onsubmit="submitGuestApplication(event)">
                     <div class="guest-form-row">
-                        <input type="text" id="guestName" placeholder="Your name / artist name" required>
-                        <input type="email" id="guestEmail" placeholder="Email" required>
+                        <input type="text" id="guestName" placeholder="Your name / artist name" aria-label="Your name or artist name" required>
+                        <input type="email" id="guestEmail" placeholder="Email" aria-label="Email address" required>
                     </div>
-                    <input type="text" id="guestLinks" placeholder="Links — SoundCloud, IG, etc. (optional)">
-                    <textarea id="guestTopic" placeholder="What do you want to talk about on the show?" required></textarea>
+                    <input type="text" id="guestLinks" placeholder="Links — SoundCloud, IG, etc. (optional)" aria-label="Links to your music or socials, optional">
+                    <textarea id="guestTopic" placeholder="What do you want to talk about on the show?" aria-label="What do you want to talk about on the show" required></textarea>
                     <button type="submit" class="cta-button" style="justify-content:center;"><i class="fas fa-paper-plane"></i> Apply to Join the Show</button>
                 </form>
             </div>

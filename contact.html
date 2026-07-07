@@ -6,6 +6,14 @@
     <title>Contact — p2k-music.ca</title>
     <meta name="description" content="Book P2K, follow across platforms, read the license and leave a comment.">
     <meta name="theme-color" content="#05060d">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%2305060d'/%3E%3Ccircle cx='32' cy='32' r='24' fill='none' stroke='%2300d4ff' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='%23ff2d95' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%23ffc439'/%3E%3C/svg%3E">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="p2k-music.ca">
+    <meta property="og:title" content="Contact & Booking — P2K">
+    <meta property="og:description" content="Book P2K, follow across platforms, read the license and leave a comment.">
+    <meta property="og:url" content="https://p2k-music.ca/contact.html">
+    <meta property="og:image" content="https://p2k-music.ca/background.jpg">
+    <meta name="twitter:card" content="summary_large_image">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
@@ -32,6 +40,7 @@
                 <li><a class="navlink" data-nav="tour" href="tour.html">Tour</a></li>
                 <li><a class="navlink" data-nav="gallery" href="gallery.html">Gallery</a></li>
                 <li><a class="navlink" data-nav="merch" href="merch.html">Merch</a></li>
+                <li><a class="navlink" data-nav="news" href="news.html">News</a></li>
                 <li><a class="navlink" data-nav="contact" href="contact.html">Contact</a></li>
             </ul>
             <div class="nav-right">
@@ -65,15 +74,15 @@
                 <h3><i class="fas fa-calendar-check"></i> Booking &amp; Enquiries</h3>
                 <p>Shows, features, remixes or licensing? Send a message and P2K will get back to you.</p>
                 <form class="booking-form" onsubmit="handleBooking(event)">
-                    <input type="text" id="bookName" placeholder="Your name" required>
-                    <input type="email" id="bookEmail" placeholder="Email address" required>
-                    <select id="bookType">
+                    <input type="text" id="bookName" placeholder="Your name" aria-label="Your name" required>
+                    <input type="email" id="bookEmail" placeholder="Email address" aria-label="Email address" required>
+                    <select id="bookType" aria-label="Enquiry type">
                         <option value="Booking">Booking / Show</option>
                         <option value="Feature">Feature / Collab</option>
                         <option value="Licensing">Licensing</option>
                         <option value="Other">Other</option>
                     </select>
-                    <textarea id="bookMsg" placeholder="Tell P2K what you're planning..." required></textarea>
+                    <textarea id="bookMsg" placeholder="Tell P2K what you're planning..." aria-label="Your message" required></textarea>
                     <button type="submit" class="cta-button" style="width:100%; justify-content:center;"><i class="fas fa-paper-plane"></i> Send Message</button>
                 </form>
             </div>
@@ -98,7 +107,7 @@
 
             <h3 style="margin-top: 2rem; margin-bottom: 1rem; color: var(--cyan); font-family: 'Orbitron', monospace;">Recent Comments</h3>
             <ul class="comments-list" id="commentsList">
-                <div class="no-comments">No comments yet. Be the first to comment!</div>
+                <li class="no-comments">No comments yet. Be the first to comment!</li>
             </ul>
         </div>
     </section><section id="license" class="section">
@@ -107,15 +116,15 @@
             <h2 class="section-title">License &amp; Legal</h2>
         </div>
         <div class="license-section reveal">
-            <h3>MIT License</h3>
+            <h3>Rights &amp; Usage</h3>
             <div class="license-content">
-                <p><strong>p2k-music.ca Content Management System</strong></p>
-                <p>This project is licensed under the MIT License. You are free to use, modify, and distribute this software, provided you include the original license and copyright notice.</p>
-                <p><strong>Permissions:</strong> Commercial Use • Modification • Distribution • Private Use</p>
-                <p><strong>Conditions:</strong> License and copyright notice must be included</p>
-                <p><strong>Limitations:</strong> No Liability • No Warranty</p>
-                <p style="margin-top: 1rem; opacity: 0.7; font-size: 0.9rem;">© 2024 p2k-music.ca. All music rights reserved.</p>
-                <span class="license-badge"><i class="fas fa-certificate"></i> MIT License</span>
+                <p><strong>p2k-music.ca — Music &amp; Content</strong></p>
+                <p>All music, recordings, artwork and content on this site are the property of P2K. <strong>All rights reserved.</strong> Streaming previews here is free; a purchased track is licensed for personal listening only.</p>
+                <p><strong>You may:</strong> Stream previews • Play &amp; keep tracks you've purchased • Share links to this site</p>
+                <p><strong>You may not:</strong> Redistribute, resell, remix or sample any track without written permission from P2K</p>
+                <p>For licensing, sync, remix or sampling requests, use the booking form above — commercial licensing is available.</p>
+                <p style="margin-top: 1rem; opacity: 0.7; font-size: 0.9rem;">© 2024 p2k-music.ca. All rights reserved.</p>
+                <span class="license-badge"><i class="fas fa-certificate"></i> All Rights Reserved</span>
             </div>
         </div>
     </section>

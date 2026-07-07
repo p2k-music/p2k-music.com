@@ -6,6 +6,14 @@
     <title>Admin — p2k-music.ca</title>
     <meta name="description" content="Owner dashboard for p2k-music.ca.">
     <meta name="theme-color" content="#05060d">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%2305060d'/%3E%3Ccircle cx='32' cy='32' r='24' fill='none' stroke='%2300d4ff' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='%23ff2d95' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%23ffc439'/%3E%3C/svg%3E">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="p2k-music.ca">
+    <meta property="og:title" content="Admin — p2k-music.ca">
+    <meta property="og:description" content="Owner dashboard for p2k-music.ca.">
+    <meta property="og:url" content="https://p2k-music.ca/admin.html">
+    <meta property="og:image" content="https://p2k-music.ca/background.jpg">
+    <meta name="twitter:card" content="summary_large_image">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
@@ -34,6 +42,7 @@
                 <li><a class="navlink" data-nav="tour" href="tour.html">Tour</a></li>
                 <li><a class="navlink" data-nav="gallery" href="gallery.html">Gallery</a></li>
                 <li><a class="navlink" data-nav="merch" href="merch.html">Merch</a></li>
+                <li><a class="navlink" data-nav="news" href="news.html">News</a></li>
                 <li><a class="navlink" data-nav="contact" href="contact.html">Contact</a></li>
             </ul>
             <div class="nav-right">
@@ -71,8 +80,8 @@
     <section class="page-hero" style="padding-bottom:0.5rem;">
         <span class="eyebrow"><span class="dot"></span> Owner Area</span>
         <h1>Admin</h1>
-        <p>Manage content, run the door, and monitor profit. Enter the passcode to unlock.</p>
-        <div style="margin-top:1.2rem;"><button class="cta-button" onclick="showAdminLogin()"><i class="fas fa-lock-open"></i> Enter Passcode</button></div>
+        <p>Manage content, run the door, and monitor profit. Sign in with your admin email — a one-time code is sent to your inbox.</p>
+        <div style="margin-top:1.2rem;"><button class="cta-button" onclick="showAdminLogin()"><i class="fas fa-lock-open"></i> Admin Sign In</button></div>
     </section>
     <div id="admin-wallet">
         <div class="wallet-header">
@@ -113,7 +122,7 @@
         <div id="w-error"></div>
 
         <div class="wallet-controls">
-            <input type="number" id="w-amount" placeholder="Enter amount (min $1.55)" step="0.01">
+            <input type="number" id="w-amount" placeholder="Enter amount (min $1.55)" aria-label="Withdrawal amount in CAD" step="0.01">
             <button class="wallet-btn" onclick="setWAll()">All</button>
             <button class="wallet-btn" onclick="sendWithdraw()">Withdraw</button>
         </div>
@@ -236,7 +245,7 @@
                 </div>
                 <button class="btn" id="scanToggleBtn" onclick="toggleScanner()" style="width:100%; margin:0;"><i class="fas fa-camera"></i> Start Camera</button>
                 <div class="manual-entry">
-                    <input type="text" id="manualCode" class="tm-input" placeholder="Ticket code (P2K-XXX-XXXXXX)" style="margin:0;">
+                    <input type="text" id="manualCode" class="tm-input" placeholder="Ticket code (P2K-XXX-XXXXXX)" aria-label="Ticket code" style="margin:0;">
                     <button class="btn" onclick="checkInManual()" style="margin:0;"><i class="fas fa-magnifying-glass"></i> Check</button>
                 </div>
                 <p class="checkin-note"><i class="fas fa-circle-info"></i> Validates tickets stored on this device. Cross-device door checks arrive with the backend (server ticket lookup).</p>
@@ -318,6 +327,5 @@
     </footer>
 
     <script src="assets/app.js"></script>
-    <script>if(localStorage.getItem("p2kMusicAdmin")!=="true"){setTimeout(function(){if(typeof showAdminLogin==="function")showAdminLogin();},800);}</script>
 </body>
 </html>

@@ -1,6 +1,5 @@
         // NOTE: admin auth is now verified SERVER-SIDE (POST /api/admin/login).
         // The passcode never lives in client code anymore — see server/auth.js.
-        const STORAGE_KEY = 'p2kMusicAdmin';
         const DB_NAME = 'p2kMusicDB';
         const DB_VERSION = 6;
         const SONG_PRICE = 16;
@@ -564,7 +563,7 @@
                 const isDefaultSong = !song.uploaded;
                 return `
                 <div class="song-card" id="songCard${song.id}">
-                    <div class="song-title"><i class="fas fa-music"></i> ${song.title}</div>
+                    <div class="song-title"><i class="fas fa-music"></i> ${escapeHTML(song.title)}</div>
                     <div class="play-controls">
                         <button class="play-btn" onclick="togglePlay(${song.id}, ${songIndex})">
                             <i class="fas fa-play" id="playIcon${song.id}"></i>
@@ -578,7 +577,7 @@
                     <div class="song-price">
                         ${isOwned ? `
                             <span class="purchased-badge"><i class="fas fa-check-circle"></i> Owned</span>
-                            ${isDefaultSong ? `<a class="download-btn" href="${encodeAudioURL(song.file)}" download="${song.title}.mp3" onclick="event.stopPropagation()"><i class="fas fa-download"></i> Download</a>` : ''}
+                            ${isDefaultSong ? `<a class="download-btn" href="${escapeHTML(encodeAudioURL(song.file))}" download="${escapeHTML(song.title)}.mp3" onclick="event.stopPropagation()"><i class="fas fa-download"></i> Download</a>` : ''}
                         ` : isDefaultSong ? `
                             <span class="price-tag">$${SONG_PRICE} CAD</span>
                             <button class="buy-btn" onclick="openPaypalModal(${song.id})"><i class="fab fa-paypal"></i> Buy Now</button>
@@ -594,7 +593,7 @@
             if (!grid) return;
             grid.innerHTML = images.map(image => `
                 <div class="image-card">
-                    <img src="${image.src}" alt="${image.title}" class="gallery-image" onclick="setBackground('${image.src.replace(/'/g, "\\'")}')">
+                    <img src="${escapeHTML(image.src)}" alt="${escapeHTML(image.title)}" class="gallery-image" onclick="setBackground('${escapeHTML(image.src.replace(/'/g, "\\'"))}')">
                     <div class="image-overlay">
                         ${isAdmin ? `<button class="btn btn-danger" onclick="removeImage(${image.id})"><i class="fas fa-trash"></i></button>` : ''}
                     </div>
@@ -837,15 +836,15 @@
             comments.sort((a, b) => b.id - a.id);
 
             if (comments.length === 0) {
-                commentsList.innerHTML = '<div class="no-comments">No comments yet. Be the first to comment!</div>';
+                commentsList.innerHTML = '<li class="no-comments">No comments yet. Be the first to comment!</li>';
                 return;
             }
 
             commentsList.innerHTML = comments.map(comment => `
                 <li class="comment-item">
-                    <div class="comment-author">${comment.name}</div>
-                    <div class="comment-date">${comment.date}</div>
-                    <div class="comment-text">${comment.text}</div>
+                    <div class="comment-author">${escapeHTML(comment.name)}</div>
+                    <div class="comment-date">${escapeHTML(comment.date)}</div>
+                    <div class="comment-text">${escapeHTML(comment.text)}</div>
                 </li>
             `).join('');
         }
@@ -860,7 +859,7 @@
             setTimeout(() => notification.classList.add('show'), 100);
             setTimeout(() => {
                 notification.classList.remove('show');
-                setTimeout(() => document.body.removeChild(notification), 300);
+                setTimeout(() => notification.remove(), 300);
             }, 3000);
         }
 
@@ -872,12 +871,16 @@
         // SMOOTH SCROLL
         document.querySelectorAll('a[href^="#"]').forEach(anchor => {
             anchor.addEventListener('click', function (e) {
+                const href = this.getAttribute('href');
+                if (!href || href.length < 2) return; // bare "#" links (e.g. Cookie Settings) handle themselves
                 e.preventDefault();
-                const target = document.querySelector(this.getAttribute('href'));
+                let target = null;
+                try { target = document.querySelector(href); } catch (err) { /* not a valid selector */ }
                 if (target) {
                     target.scrollIntoView({ behavior: 'smooth', block: 'start' });
                 }
-                document.getElementById('navLinks').classList.remove('active');
+                const nl = document.getElementById('navLinks');
+                if (nl) nl.classList.remove('active');
             });
         });
 
@@ -1089,10 +1092,10 @@
             container.innerHTML = posts.map(post => `
                 <div class="news-post">
                     <div class="news-post-header">
-                        <div class="news-post-title"><i class="fas fa-bullhorn"></i> ${post.title}</div>
-                        <div class="news-post-date">${post.date}</div>
+                        <div class="news-post-title"><i class="fas fa-bullhorn"></i> ${escapeHTML(post.title)}</div>
+                        <div class="news-post-date">${escapeHTML(post.date)}</div>
                     </div>
-                    <div class="news-post-body">${post.body}</div>
+                    <div class="news-post-body">${escapeHTML(post.body).replace(/\n/g, '<br>')}</div>
                     ${isAdmin ? `<button class="btn btn-danger" onclick="deleteNews(${post.id})" style="margin-top:0.8rem; font-size:0.8rem;"><i class="fas fa-trash"></i> Delete</button>` : ''}
                 </div>
             `).join('');
@@ -1833,7 +1836,7 @@
 
         // INITIALIZE
         async function init() {
-            checkAdminStatus();
+            const adminReady = checkAdminStatus(); // resolves once the server session is known
             try {
                 await openDB();
                 await loadFromDB();
@@ -1857,6 +1860,12 @@
             setupDropZone('imageDropZone', 'imageUpload', 'image');
             setupDropZone('bgDropZone', 'bgUpload', 'bg');
             if (document.body.dataset.page === 'home') showNotification('Welcome to p2k-music.ca');
+            // Admin page: once the server has answered, prompt sign-in if needed
+            // (replaces the old localStorage gate — the server session is the truth).
+            if (document.body.dataset.page === 'admin') {
+                await adminReady;
+                if (!isAdmin) showAdminLogin();
+            }
         }
 
         // WALLET SYSTEM
@@ -1966,37 +1975,8 @@
           }
         }
 
-        // Show wallet when admin is logged in
-        function updateAdminUI() {
-            const adminPanel = document.getElementById('adminPanel');
-            const adminBadge = document.getElementById('adminBadge');
-            const logoutBtn = document.getElementById('logoutBtn');
-            const adminLoginBtn = document.getElementById('adminLoginBtn');
-            const walletPanel = document.getElementById('admin-wallet');
-            const checkinSection = document.getElementById('checkin');
-
-            if (isAdmin) {
-                adminPanel.classList.add('show');
-                adminBadge.style.display = 'block';
-                logoutBtn.classList.add('show');
-                adminLoginBtn.style.display = 'none';
-                walletPanel.classList.add('show');
-                if (checkinSection) { checkinSection.style.display = 'block'; loadCheckinLog(); }
-                const profitSection = document.getElementById('profit');
-                if (profitSection) { profitSection.style.display = 'block'; renderProfit(); }
-                walletLoad();
-            } else {
-                adminPanel.classList.remove('show');
-                adminBadge.style.display = 'none';
-                logoutBtn.classList.remove('show');
-                adminLoginBtn.style.display = 'block';
-                walletPanel.classList.remove('show');
-                if (checkinSection) checkinSection.style.display = 'none';
-                const profitSectionOff = document.getElementById('profit');
-                if (profitSectionOff) profitSectionOff.style.display = 'none';
-                stopScanner();
-            }
-        }
+        // updateAdminUI lives at the bottom of this file (the page-safe,
+        // null-guarded version) — every page shares it.
 
         /* ============================================================
            VISUAL FX LAYER (particles, visualizer, scrollspy, reveal,
@@ -2026,7 +2006,10 @@
         function initScrollspy() {
             const links = Array.from(document.querySelectorAll('.nav-links a'));
             const map = {};
-            links.forEach(a => { const id = a.getAttribute('href').slice(1); if (id) map[id] = a; });
+            links.forEach(a => {
+                const href = a.getAttribute('href') || '';
+                if (href.startsWith('#') && href.length > 1) map[href.slice(1)] = a;
+            });
             const sections = Object.keys(map).map(id => document.getElementById(id)).filter(Boolean);
             const spy = new IntersectionObserver((entries) => {
                 entries.forEach(en => {
@@ -2299,6 +2282,16 @@
                 });
             } catch (e) { /* adsbygoogle.js blocked or not yet loaded */ }
         }
+        // Units still carrying a placeholder slot id can never serve — hide the
+        // whole "Advertisement" box instead of showing fans an empty frame.
+        function hidePlaceholderAdSlots() {
+            document.querySelectorAll('ins.adsbygoogle').forEach(function (unit) {
+                if (!/^\d+$/.test((unit.getAttribute('data-ad-slot') || '').trim())) {
+                    const wrap = unit.closest('.ad-slot');
+                    if (wrap) wrap.style.display = 'none';
+                }
+            });
+        }
         function setCookieConsent(choice) {
             try { localStorage.setItem(COOKIE_KEY, choice); } catch (e) {}
             const banner = document.getElementById('cookieBanner');
@@ -2325,10 +2318,19 @@
             initTilt();
             initParticles();
             onScrollFx();
+            hidePlaceholderAdSlots();
             initCookieConsent();
             // idle visualizer so the hero always has motion
             startViz(false);
         }
+
+        // Keyboard access for pointer-only cards marked role="button"
+        document.addEventListener('keydown', (e) => {
+            if ((e.key === 'Enter' || e.key === ' ') && e.target && e.target.matches && e.target.matches('[role="button"]')) {
+                e.preventDefault();
+                e.target.click();
+            }
+        });
 
         // Hook wallet + visualizer into audio player
         const originalTogglePlay = togglePlay;
