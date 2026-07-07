@@ -11,6 +11,26 @@ for normal traffic (Workers + D1 free tiers are generous).
 > Everything you type is safe to run. Commands are for **Windows PowerShell**
 > (what's on your PC). Where Mac/Linux differs, it's noted.
 
+## Fastest path — the one-command script
+
+If you'd rather not run each step by hand, there's a script that does the whole
+thing (link account → create database → set secrets → deploy). From the project
+folder in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File worker\deploy.ps1
+```
+
+It's safe to re-run — it only creates what's missing and only asks for secrets it
+doesn't already have. It opens your browser once to link **your** Cloudflare
+account, generates the signing key for you, and prompts for the admin/SMTP/PayPal
+values. When it finishes it prints your live URL.
+
+Prefer to understand each step (or the script hit a snag)? The manual walkthrough
+below does exactly the same thing, one command at a time.
+
+---
+
 ---
 
 ## Before you start — have these ready
